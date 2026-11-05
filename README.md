@@ -131,7 +131,7 @@ This is for when you have a panel on **both** servers (Iran + foreign) and want 
 
 **1. Install paqctl on the foreign server (server role):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SamNet-dev/paqctl/main/paqctl.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/4H1R/paqctl/main/paqctl.sh | sudo bash
 ```
 - Choose **server** role
 - Set port mapping: `14000:443` (where `443` is your panel's inbound port)
@@ -139,7 +139,7 @@ curl -fsSL https://raw.githubusercontent.com/SamNet-dev/paqctl/main/paqctl.sh | 
 
 **2. Install paqctl on the Iran server (client role):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SamNet-dev/paqctl/main/paqctl.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/4H1R/paqctl/main/paqctl.sh | sudo bash
 ```
 - Choose **client** role
 - Use the **exact same** port mappings shown in the server output (e.g. `14000:443,14001:10443`)
@@ -252,7 +252,7 @@ paqctl v1.1.0 introduces powerful automated optimizations while making installat
 Run this on your VPS (requires root):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SamNet-dev/paqctl/main/paqctl.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/4H1R/paqctl/main/paqctl.sh | sudo bash
 ```
 
 > The installer automatically downloads the latest paqet release from GitHub.
@@ -294,7 +294,7 @@ The simplest way to get started - just download, double-click, and connect!
 
 ### Step 1: Download
 
-1. Go to: https://github.com/SamNet-dev/paqctl
+1. Go to: https://github.com/4H1R/paqctl
 2. Click the green **"Code"** button → **"Download ZIP"**
 3. Extract the ZIP file anywhere (e.g., Desktop)
 4. Open the `windows` folder inside
@@ -343,12 +343,12 @@ For more control, use the interactive PowerShell menu.
 
 **Option A: One-liner (downloads and runs automatically)**
 ```powershell
-irm https://raw.githubusercontent.com/SamNet-dev/paqctl/main/windows/paqet-client.ps1 | iex
+irm https://raw.githubusercontent.com/4H1R/paqctl/main/windows/paqet-client.ps1 | iex
 ```
 
 **Option B: Download first, then run**
 ```powershell
-git clone https://github.com/SamNet-dev/paqctl.git
+git clone https://github.com/4H1R/paqctl.git
 cd paqctl\windows
 .\paqet-client.ps1
 ```
@@ -595,11 +595,11 @@ macOS requires manual setup since there's no automated script yet.
 mkdir -p ~/paqet && cd ~/paqet
 
 # Download latest release (Intel Mac)
-curl -LO https://github.com/hanselime/paqet/releases/download/v1.0.0-alpha.20/paqet-darwin-amd64-v1.0.0-alpha.20.tar.gz
+curl -LO https://github.com/4H1R/paqet/releases/download/v1.0.0-alpha.21-a1/paqet-darwin-amd64-v1.0.0-alpha.21-a1.tar.gz
 tar -xzf paqet-darwin-amd64-v1.0.0-alpha.20.tar.gz
 
 # For Apple Silicon (M1/M2/M3):
-# curl -LO https://github.com/hanselime/paqet/releases/download/v1.0.0-alpha.20/paqet-darwin-arm64-v1.0.0-alpha.20.tar.gz
+# curl -LO https://github.com/4H1R/paqet/releases/download/v1.0.0-alpha.21-a1/paqet-darwin-arm64-v1.0.0-alpha.21-a1.tar.gz
 # tar -xzf paqet-darwin-arm64-v1.0.0-alpha.20.tar.gz
 
 # Make executable
@@ -671,7 +671,7 @@ brew install python@3.11
 #### Step 2: Clone the Repository
 
 ```bash
-git clone https://github.com/SamNet-dev/paqctl.git
+git clone https://github.com/4H1R/paqctl.git
 cd paqctl/gfk/client
 ```
 
@@ -793,7 +793,7 @@ Then run GFK from within the venv.
 ```bash
 # Download paqet
 mkdir -p ~/paqet && cd ~/paqet
-curl -LO https://github.com/hanselime/paqet/releases/download/v1.0.0-alpha.20/paqet-linux-amd64-v1.0.0-alpha.20.tar.gz
+curl -LO https://github.com/4H1R/paqet/releases/download/v1.0.0-alpha.21-a1/paqet-linux-amd64-v1.0.0-alpha.21-a1.tar.gz
 tar -xzf paqet-linux-amd64-v1.0.0-alpha.20.tar.gz
 chmod +x paqet_linux_amd64
 
@@ -839,7 +839,7 @@ sudo apt install python3 python3-pip  # Debian/Ubuntu
 pip3 install scapy aioquic
 
 # Clone and configure
-git clone https://github.com/SamNet-dev/paqctl.git
+git clone https://github.com/4H1R/paqctl.git
 cd paqctl/gfk/client
 
 # Create parameters.py (same as macOS section above)
@@ -892,7 +892,7 @@ Key:          _______________  (e.g., mySecretKey123)
 
 Do this on a machine that CAN access GitHub (your VPS, a friend's computer, VPN, etc.)
 
-**Go to:** https://github.com/hanselime/paqet/releases
+**Go to:** https://github.com/4H1R/paqet/releases
 
 > **Note:** Check for the latest version. Examples below use v1.0.0-alpha.20 - use newer if available.
 
@@ -1320,7 +1320,7 @@ If you find this project useful and want to support its development, you can don
 
 **۱. نصب paqctl روی سرور خارج (نقش server):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SamNet-dev/paqctl/main/paqctl.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/4H1R/paqctl/main/paqctl.sh | sudo bash
 ```
 - نقش **server** را انتخاب کنید
 - مپینگ پورت: `14000:443` (که `443` پورت اینباند پنل شماست)
@@ -1328,7 +1328,7 @@ curl -fsSL https://raw.githubusercontent.com/SamNet-dev/paqctl/main/paqctl.sh | 
 
 **۲. نصب paqctl روی سرور ایران (نقش client):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SamNet-dev/paqctl/main/paqctl.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/4H1R/paqctl/main/paqctl.sh | sudo bash
 ```
 - نقش **client** را انتخاب کنید
 - **دقیقاً همان** مپینگ‌هایی که در خروجی سرور نمایش داده شد را استفاده کنید (مثلاً `14000:443,14001:10443`)
@@ -1441,7 +1441,7 @@ paqctl به صورت خودکار SOCKS5 را روی پورت آزاد بعدی 
 این دستور را روی VPS خود اجرا کنید (نیاز به root دارد):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SamNet-dev/paqctl/main/paqctl.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/4H1R/paqctl/main/paqctl.sh | sudo bash
 ```
 
 سپس منوی تعاملی را باز کنید:
@@ -1481,7 +1481,7 @@ sudo paqctl info
 
 ### مرحله ۱: دانلود
 
-1. بروید به: https://github.com/SamNet-dev/paqctl
+1. بروید به: https://github.com/4H1R/paqctl
 2. روی دکمه سبز **"Code"** کلیک کنید → **"Download ZIP"**
 3. فایل ZIP را در هر جایی استخراج کنید (مثلاً دسکتاپ)
 4. وارد پوشه `windows` شوید
@@ -1530,12 +1530,12 @@ sudo paqctl info
 
 **گزینه A: یک خطی (خودکار دانلود و اجرا می‌کند)**
 ```powershell
-irm https://raw.githubusercontent.com/SamNet-dev/paqctl/main/windows/paqet-client.ps1 | iex
+irm https://raw.githubusercontent.com/4H1R/paqctl/main/windows/paqet-client.ps1 | iex
 ```
 
 **گزینه B: اول دانلود، بعد اجرا**
 ```powershell
-git clone https://github.com/SamNet-dev/paqctl.git
+git clone https://github.com/4H1R/paqctl.git
 cd paqctl\windows
 .\paqet-client.ps1
 ```
@@ -1765,11 +1765,11 @@ macOS نیاز به راه‌اندازی دستی دارد.
 mkdir -p ~/paqet && cd ~/paqet
 
 # برای Intel Mac:
-curl -LO https://github.com/hanselime/paqet/releases/download/v1.0.0-alpha.20/paqet-darwin-amd64-v1.0.0-alpha.20.tar.gz
+curl -LO https://github.com/4H1R/paqet/releases/download/v1.0.0-alpha.21-a1/paqet-darwin-amd64-v1.0.0-alpha.21-a1.tar.gz
 tar -xzf paqet-darwin-amd64-v1.0.0-alpha.20.tar.gz
 
 # برای Apple Silicon (M1/M2/M3):
-# curl -LO https://github.com/hanselime/paqet/releases/download/v1.0.0-alpha.20/paqet-darwin-arm64-v1.0.0-alpha.20.tar.gz
+# curl -LO https://github.com/4H1R/paqet/releases/download/v1.0.0-alpha.21-a1/paqet-darwin-arm64-v1.0.0-alpha.21-a1.tar.gz
 # tar -xzf paqet-darwin-arm64-v1.0.0-alpha.20.tar.gz
 
 chmod +x paqet_darwin_amd64
@@ -1834,7 +1834,7 @@ brew install python@3.11
 #### مرحله ۲: کلون مخزن
 
 ```bash
-git clone https://github.com/SamNet-dev/paqctl.git
+git clone https://github.com/4H1R/paqctl.git
 cd paqctl/gfk/client
 ```
 
@@ -1882,7 +1882,7 @@ sudo python3 mainclient.py
 ```bash
 # دانلود paqet
 mkdir -p ~/paqet && cd ~/paqet
-curl -LO https://github.com/hanselime/paqet/releases/download/v1.0.0-alpha.20/paqet-linux-amd64-v1.0.0-alpha.20.tar.gz
+curl -LO https://github.com/4H1R/paqet/releases/download/v1.0.0-alpha.21-a1/paqet-linux-amd64-v1.0.0-alpha.21-a1.tar.gz
 tar -xzf paqet-linux-amd64-v1.0.0-alpha.20.tar.gz
 chmod +x paqet_linux_amd64
 
@@ -1926,7 +1926,7 @@ sudo apt install python3 python3-pip  # Debian/Ubuntu
 pip3 install scapy aioquic
 
 # کلون و پیکربندی
-git clone https://github.com/SamNet-dev/paqctl.git
+git clone https://github.com/4H1R/paqctl.git
 cd paqctl/gfk/client
 
 # ایجاد parameters.py (مشابه بخش macOS)
@@ -1973,7 +1973,7 @@ sudo paqctl info
 
 این کار را روی دستگاهی انجام دهید که به GitHub دسترسی دارد (VPS شما، کامپیوتر دوست، VPN و غیره)
 
-**بروید به:** https://github.com/hanselime/paqet/releases
+**بروید به:** https://github.com/4H1R/paqet/releases
 
 > **نکته:** آخرین نسخه را چک کنید. مثال‌های زیر از v1.0.0-alpha.20 استفاده می‌کنند - اگر جدیدتر موجود است آن را بگیرید.
 

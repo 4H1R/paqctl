@@ -16,7 +16,7 @@
 # ╚═══════════════════════════════════════════════════════════════════╝
 #
 # Usage:
-# curl -sL https://raw.githubusercontent.com/SamNet-dev/paqctl/main/paqctl.sh | sudo bash
+# curl -sL https://raw.githubusercontent.com/4H1R/paqctl/main/paqctl.sh | sudo bash
 #
 # Or: wget paqctl.sh && sudo bash paqctl.sh
 #
@@ -33,15 +33,15 @@ fi
 VERSION="1.1.0"
 
 # Pinned versions for stability (update these after testing new releases)
-PAQET_VERSION_PINNED="v1.0.0-alpha.20"
+PAQET_VERSION_PINNED="v1.0.0-alpha.21-a1"
 XRAY_VERSION_PINNED="v26.2.4"
 GFK_VERSION_PINNED="v1.0.0"
 
-PAQET_REPO="hanselime/paqet"
+PAQET_REPO="4H1R/paqet"
 PAQET_API_URL="https://api.github.com/repos/${PAQET_REPO}/releases/latest"
 INSTALL_DIR="${INSTALL_DIR:-/opt/paqctl}"
 BACKUP_DIR="$INSTALL_DIR/backups"
-GFK_REPO="SamNet-dev/paqctl"
+GFK_REPO="4H1R/paqctl"
 GFK_BRANCH="main"
 GFK_RAW_URL="https://raw.githubusercontent.com/${GFK_REPO}/${GFK_BRANCH}/gfk"
 GFK_DIR="$INSTALL_DIR/gfk"
@@ -1012,21 +1012,17 @@ network:
   tcp:
     local_flag: ${_tcp_local_flags}
     remote_flag: ${_tcp_remote_flags}
+  pcap:
+    sockbuf: $(( _sockbuf > 8388608 ? _sockbuf : 8388608 ))
 
 transport:
   protocol: "kcp"
   kcp:
     mode: "fast"
     key: "${_y_key}"
-    conn: ${_conn}
     mtu: ${_mtu}
     sndwnd: ${_sndwnd}
     rcvwnd: ${_rcvwnd}
-    nodelay: ${_nodelay}
-    interval: ${_interval}
-    resend: ${_resend}
-    nocongestion: ${_nocongestion}
-    sockbuf: ${_sockbuf}
     smuxbuf: ${_smuxbuf}
 EOF
         else
@@ -1057,24 +1053,21 @@ network:
   tcp:
     local_flag: ${_tcp_local_flags}
     remote_flag: ${_tcp_remote_flags}
+  pcap:
+    sockbuf: ${_sockbuf}
 
 server:
   addr: "${_y_server}"
 
 transport:
   protocol: "kcp"
+  conn: ${_conn}
   kcp:
     mode: "fast"
     key: "${_y_key}"
-    conn: ${_conn}
     mtu: ${_mtu}
     sndwnd: ${_sndwnd}
     rcvwnd: ${_rcvwnd}
-    nodelay: ${_nodelay}
-    interval: ${_interval}
-    resend: ${_resend}
-    nocongestion: ${_nocongestion}
-    sockbuf: ${_sockbuf}
     smuxbuf: ${_smuxbuf}
 EOF
         fi
@@ -2388,15 +2381,15 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 VERSION="1.1.0"
 
 # Pinned versions for stability (update these after testing new releases)
-PAQET_VERSION_PINNED="v1.0.0-alpha.20"
+PAQET_VERSION_PINNED="v1.0.0-alpha.21-a1"
 XRAY_VERSION_PINNED="v26.2.4"
 GFK_VERSION_PINNED="v1.0.0"
 
 INSTALL_DIR="REPLACE_ME_INSTALL_DIR"
 BACKUP_DIR="$INSTALL_DIR/backups"
-PAQET_REPO="hanselime/paqet"
+PAQET_REPO="4H1R/paqet"
 PAQET_API_URL="https://api.github.com/repos/${PAQET_REPO}/releases/latest"
-GFK_REPO="SamNet-dev/paqctl"
+GFK_REPO="4H1R/paqctl"
 GFK_BRANCH="main"
 GFK_RAW_URL="https://raw.githubusercontent.com/${GFK_REPO}/${GFK_BRANCH}/gfk"
 GFK_DIR="$INSTALL_DIR/gfk"
@@ -3137,21 +3130,17 @@ network:
   tcp:
     local_flag: ${_tcp_local_flags}
     remote_flag: ${_tcp_remote_flags}
+  pcap:
+    sockbuf: $(( _sockbuf > 8388608 ? _sockbuf : 8388608 ))
 
 transport:
   protocol: "kcp"
   kcp:
     mode: "fast"
     key: "${_y_key}"
-    conn: ${_conn}
     mtu: ${_mtu}
     sndwnd: ${_sndwnd}
     rcvwnd: ${_rcvwnd}
-    nodelay: ${_nodelay}
-    interval: ${_interval}
-    resend: ${_resend}
-    nocongestion: ${_nocongestion}
-    sockbuf: ${_sockbuf}
     smuxbuf: ${_smuxbuf}
 EOF
     else
@@ -3182,24 +3171,21 @@ network:
   tcp:
     local_flag: ${_tcp_local_flags}
     remote_flag: ${_tcp_remote_flags}
+  pcap:
+    sockbuf: ${_sockbuf}
 
 server:
   addr: "${_y_server}"
 
 transport:
   protocol: "kcp"
+  conn: ${_conn}
   kcp:
     mode: "fast"
     key: "${_y_key}"
-    conn: ${_conn}
     mtu: ${_mtu}
     sndwnd: ${_sndwnd}
     rcvwnd: ${_rcvwnd}
-    nodelay: ${_nodelay}
-    interval: ${_interval}
-    resend: ${_resend}
-    nocongestion: ${_nocongestion}
-    sockbuf: ${_sockbuf}
     smuxbuf: ${_smuxbuf}
 EOF
     fi
@@ -5027,7 +5013,7 @@ rollback_paqet() {
 }
 
 update_management_script() {
-    local update_url="https://raw.githubusercontent.com/SamNet-dev/paqctl/main/paqctl.sh"
+    local update_url="https://raw.githubusercontent.com/4H1R/paqctl/main/paqctl.sh"
     local tmp_script
     tmp_script=$(mktemp "/tmp/paqctl-update-XXXXXXXX.sh")
 

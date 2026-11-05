@@ -51,7 +51,7 @@ $ErrorActionPreference = "Stop"
 $ClientVersion = "v1.1.0"
 $InstallDir = "C:\paqet"
 $PaqetExe = "$InstallDir\paqet_windows_amd64.exe"
-$PaqetVersionPinned = "v1.0.0-alpha.20"   # Fallback if GitHub API unreachable
+$PaqetVersionPinned = "v1.0.0-alpha.21-a1"   # Fallback if GitHub API unreachable
 $GfkDir = "$InstallDir\gfk"
 $ConfigFile = "$InstallDir\config.yaml"
 $SettingsFile = "$InstallDir\settings.conf"
@@ -76,7 +76,7 @@ function Write-Err { Write-Host "[ERROR] $args" -ForegroundColor Red }
 # Fetch latest paqet version from GitHub, fall back to pinned
 function Get-LatestPaqetVersion {
     try {
-        $response = Invoke-RestMethod -Uri "https://api.github.com/repos/hanselime/paqet/releases/latest" -TimeoutSec 10
+        $response = Invoke-RestMethod -Uri "https://api.github.com/repos/4H1R/paqet/releases/latest" -TimeoutSec 10
         if ($response.tag_name -match '^v?\d+\.\d+\.\d+') {
             return $response.tag_name
         }
@@ -384,7 +384,7 @@ function Install-Paqet {
         }
     }
 
-    $zipUrl = "https://github.com/hanselime/paqet/releases/download/$PaqetVersion/paqet-windows-amd64-$PaqetVersion.zip"
+    $zipUrl = "https://github.com/4H1R/paqet/releases/download/$PaqetVersion/paqet-windows-amd64-$PaqetVersion.zip"
     $zipFile = "$env:TEMP\paqet.zip"
 
     Write-Info "Downloading paqet $PaqetVersion..."
@@ -620,7 +620,7 @@ function Install-Gfk {
 
     # Copy bundled GFK scripts or download from GitHub
     Write-Info "Setting up GFW-knocker scripts..."
-    $GfkGitHubBase = "https://raw.githubusercontent.com/SamNet-dev/paqctl/main/gfk/client"
+    $GfkGitHubBase = "https://raw.githubusercontent.com/4H1R/paqctl/main/gfk/client"
     foreach ($file in $GfkFiles) {
         $dest = "$GfkDir\$file"
         $src = if ($GfkLocalDir) { "$GfkLocalDir\$file" } else { $null }
@@ -953,7 +953,7 @@ function Update-Paqet {
     # Query GitHub API for latest release
     Write-Info "Querying GitHub for latest release..."
     try {
-        $apiUrl = "https://api.github.com/repos/hanselime/paqet/releases/latest"
+        $apiUrl = "https://api.github.com/repos/4H1R/paqet/releases/latest"
         $response = Invoke-RestMethod -Uri $apiUrl -TimeoutSec 30
         $latestVersion = $response.tag_name
     } catch {
@@ -990,7 +990,7 @@ function Update-Paqet {
     }
 
     # Download new version
-    $zipUrl = "https://github.com/hanselime/paqet/releases/download/$latestVersion/paqet-windows-amd64-$latestVersion.zip"
+    $zipUrl = "https://github.com/4H1R/paqet/releases/download/$latestVersion/paqet-windows-amd64-$latestVersion.zip"
     $zipFile = "$env:TEMP\paqet-update.zip"
     $extractDir = "$env:TEMP\paqet-update"
 
