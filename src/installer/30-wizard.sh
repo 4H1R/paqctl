@@ -183,7 +183,7 @@ _wizard_paqet() {
             echo -e "${BOLD}Local Forward Listen Port${NC} [14000]:"
             read -p "  Port: " input < /dev/tty || true; FORWARD_PORT="${input:-14000}"
             echo -e "${BOLD}Target Address (IP:PORT)${NC} [127.0.0.1:80]:"
-            read -p "  Target: " input < /dev/tty || true; FORWARD_TARGET="${input:-127.0.0.1:80}"
+            read -p "  Target: " input < /dev/tty || true; FORWARD_TARGET="${input:-127.0.0.1:80}"; _egress_forward_hint "$FORWARD_TARGET"
             SOCKS_PORT=1080
         else
             ROUTING_MODE="socks5"

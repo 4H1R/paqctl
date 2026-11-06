@@ -2,7 +2,7 @@
 # Versions, repositories and colours shared by the installer and the management script.
 # INSTALL_DIR must be set before this file is included.
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # Pinned versions for stability (update these after testing new releases)
 PAQET_VERSION_PINNED="v1.0.0-alpha.21-a1"

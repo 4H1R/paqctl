@@ -12,6 +12,15 @@ _apply_firewall() {
     # IP bans are independent of backend/role; re-apply them on every start
     _reapply_bans
 
+    # Egress guard (paqet server): rebuilt on every start because it binds to
+    # the service's current cgroup; removed when not wanted (other role/backend).
+    # Never fails the start: 'paqctl health' reports a missing guard.
+    local _eg_rc=0
+    _egress_guard_apply || _eg_rc=$?
+    if [ "$_eg_rc" -eq 2 ] && [ -t 1 ]; then
+        echo -e "${DIM}  Egress guard will be installed when paqet starts.${NC}"
+    fi
+
     if [ "$BACKEND" = "gfw-knocker" ]; then
         local vio_port
         if [ "$ROLE" = "server" ]; then
@@ -105,6 +114,7 @@ _remove_firewall() {
     if ! _is_firewalld_active && ! command -v iptables &>/dev/null; then
         return 0
     fi
+    _egress_guard_remove
 
     if [ "$BACKEND" = "gfw-knocker" ]; then
         local vio_port
@@ -172,6 +182,7 @@ _remove_firewall() {
 
 # Remove ALL paqctl-tagged firewall rules (for complete uninstall)
 _remove_all_paqctl_firewall_rules() {
+    _egress_guard_remove
     # firewalld: remove paqctl-tagged direct rules
     if _is_firewalld_active; then
         local _rules

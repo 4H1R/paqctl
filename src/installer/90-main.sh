@@ -7,6 +7,12 @@ if [ "${1:-}" = "--update-components" ]; then
     INSTALL_DIR="${INSTALL_DIR:-/opt/paqctl}"
     _load_settings
     create_management_script
+    # Bring firewall rules up to date for the running service (e.g. install
+    # the egress guard after an upgrade) without restarting it
+    if [ "${ROLE:-}" = "server" ] && command -v systemctl &>/dev/null && \
+       systemctl is-active --quiet paqctl.service 2>/dev/null; then
+        /usr/local/bin/paqctl _apply-firewall >/dev/null 2>&1 || true
+    fi
     exit 0
 fi
 
@@ -48,7 +54,8 @@ main() {
         _load_settings TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID TELEGRAM_INTERVAL TELEGRAM_ENABLED \
             TELEGRAM_ALERTS_ENABLED TELEGRAM_DAILY_SUMMARY TELEGRAM_WEEKLY_SUMMARY \
             TELEGRAM_SERVER_LABEL TELEGRAM_START_HOUR \
-            KCP_NODELAY KCP_INTERVAL KCP_RESEND KCP_NOCONGESTION KCP_SOCKBUF KCP_SMUXBUF
+            KCP_NODELAY KCP_INTERVAL KCP_RESEND KCP_NOCONGESTION KCP_SOCKBUF KCP_SMUXBUF \
+            EGRESS_GUARD EGRESS_ALLOW
     fi
 
     # Step 3: Configuration wizard (determines backend + role + config)

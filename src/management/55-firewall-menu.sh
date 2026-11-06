@@ -85,6 +85,17 @@ show_firewall() {
                         && echo -e "  ${GREEN}✓${NC} RST DROP (sport $port)" \
                         || echo -e "  ${RED}✗${NC} RST DROP (sport $port)  ${DIM}MISSING${NC}"
                 fi
+                echo ""
+                if ! _egress_guard_wanted; then
+                    echo -e "  ${YELLOW}!${NC} Egress guard OFF  ${DIM}(sudo paqctl config set EGRESS_GUARD=true)${NC}"
+                elif _egress_guard_active; then
+                    echo -e "  ${GREEN}✓${NC} Egress guard (paqet cannot reach private/loopback/metadata addresses)"
+                    [ -n "${EGRESS_ALLOW:-}" ] && echo -e "    ${DIM}Allowed: ${EGRESS_ALLOW}${NC}"
+                elif is_running; then
+                    echo -e "  ${RED}✗${NC} Egress guard  ${DIM}MISSING${NC}"
+                else
+                    echo -e "  ${DIM}• Egress guard is installed when paqet starts${NC}"
+                fi
             fi
 
             echo ""

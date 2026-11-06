@@ -39,6 +39,7 @@ if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ] || [ "$JSON_OUTPUT" = true ]; then
 fi
 
 #@include lib/common.sh
+#@include lib/egress.sh
 #@include lib/backends.sh
 #@include lib/xray.sh
 

@@ -60,7 +60,12 @@ _status_json() {
     else
         printf '"interface":%s,"local_ip":%s,' "$(_json_str "${INTERFACE:-}")" "$(_json_str "${LOCAL_IP:-}")"
         if [ "$ROLE" = "server" ]; then
+            local eg_on=false eg_active=false
+            _egress_guard_wanted && eg_on=true
+            _egress_guard_active && eg_active=true
             printf '"listen_port":%s,' "$(_json_num "${LISTEN_PORT:-}")"
+            printf '"egress_guard":{"enabled":%s,"active":%s,"allow":%s},' \
+                "$(_json_bool "$eg_on")" "$(_json_bool "$eg_active")" "$(_json_str "${EGRESS_ALLOW:-}")"
         else
             printf '"remote_server":%s,"socks_port":%s,"routing_mode":%s,' "$(_json_str "${REMOTE_SERVER:-}")" "$(_json_num "${SOCKS_PORT:-}")" "$(_json_str "${ROUTING_MODE:-socks5}")"
         fi
@@ -203,6 +208,15 @@ show_status() {
                 echo -e "  Firewall:   ${GREEN}Rules active${NC}"
             else
                 echo -e "  Firewall:   ${RED}Rules missing${NC}"
+            fi
+            if ! _egress_guard_wanted; then
+                echo -e "  Egress:     ${YELLOW}Guard off${NC} ${DIM}(clients can reach private networks)${NC}"
+            elif _egress_guard_active; then
+                echo -e "  Egress:     ${GREEN}Private networks blocked${NC}${EGRESS_ALLOW:+ ${DIM}(allowed: ${EGRESS_ALLOW})${NC}}"
+            elif is_running; then
+                echo -e "  Egress:     ${RED}Guard missing${NC} ${DIM}(sudo paqctl doctor --fix)${NC}"
+            else
+                echo -e "  Egress:     ${DIM}Guard installed on start${NC}"
             fi
         else
             echo -e "  Server:     ${REMOTE_SERVER}"
@@ -460,6 +474,19 @@ _run_health_checks() {
             else
                 _hc fail "iptables RST DROP rule missing" "Apply firewall rules: sudo paqctl firewall (option 1)" firewall
             fi
+            if ! _egress_guard_wanted; then
+                _hc warn "Egress guard is off: clients can reach this host's loopback, private networks and cloud metadata" \
+                    "Turn it on: sudo paqctl config set EGRESS_GUARD=true"
+            elif _is_firewalld_active; then
+                _hc warn "Egress guard is not available with firewalld: clients can reach this host's private networks"
+            elif [ ! -d /run/systemd/system ]; then
+                _hc warn "Egress guard needs systemd: clients can reach this host's private networks"
+            elif _egress_guard_active; then
+                _hc ok "Egress guard on (clients cannot reach private/loopback/metadata addresses)"
+            elif is_running; then
+                _hc fail "Egress guard missing: clients can reach this host's private networks" \
+                    "Apply firewall rules: sudo paqctl doctor --fix" firewall
+            fi
             if is_running; then
                 if ss -tlnp 2>/dev/null | grep -q ":${LISTEN_PORT}"; then
                     _hc ok "Port $LISTEN_PORT is listening"
@@ -564,6 +591,21 @@ _run_doctor_checks() {
             if ss -tlnp 2>/dev/null | grep -qE "[:.]${SOCKS_PORT:-1080}[[:space:]]"; then
                 _hc fail "SOCKS5 port ${SOCKS_PORT:-1080} is already used by another process" \
                     "Free the port (ss -tlnp | grep :${SOCKS_PORT:-1080}) or pick another: sudo paqctl config set SOCKS_PORT=<port>"
+            fi
+        fi
+
+        if [ "$ROLE" = "server" ] && _egress_guard_wanted && _egress_guard_active && is_running; then
+            case "$(_egress_selftest)" in
+                blocked) _hc ok "Egress guard verified (paqet's connection to 127.0.0.1 was rejected)" ;;
+                open)    _hc fail "Egress guard is not blocking paqet (stale rule?)" \
+                             "Rebuild it: sudo paqctl doctor --fix (or sudo paqctl restart)" firewall ;;
+            esac
+            local _blocks _nblk
+            _blocks=$(_egress_recent_blocks "24 hours ago")
+            if [ -n "$_blocks" ]; then
+                _nblk=$(awk '{s += $1} END {print s + 0}' <<< "$_blocks")
+                _hc info "Egress guard rejected ${_nblk}+ connection(s) in 24h; top: $(head -3 <<< "$_blocks" | awk '{c=$1; $1=""; printf "%s%s (x%s)", (NR>1?", ":""), substr($0,2), c}')" \
+                    "If a client really needs one of these, allow it: sudo paqctl config set EGRESS_ALLOW=\"127.0.0.1:80\" (see: paqctl help config)"
             fi
         fi
 

@@ -184,11 +184,18 @@ EOF
     LISTEN_PORT SOCKS_PORT FORWARD_PORT REMOTE_SERVER FORWARD_TARGET INTERFACE
     LOCAL_IP GATEWAY_MAC ENCRYPTION_KEY PAQET_TCP_LOCAL_FLAG PAQET_TCP_REMOTE_FLAG
     ROUTING_MODE KCP_MODE KCP_MTU KCP_CONN KCP_SNDWND KCP_RCVWND GFK_SERVER_IP GFK_AUTH_CODE
-    TELEGRAM_SERVER_LABEL
+    TELEGRAM_SERVER_LABEL EGRESS_GUARD EGRESS_ALLOW
   Examples:
     paqctl config set LISTEN_PORT=9443
     paqctl config set KCP_MTU=1200 SOCKS_PORT=1081
     paqctl config set KCP_MODE=fast2      (normal, fast, fast2, fast3 or manual)
+  Egress guard (server): clients cannot reach this host's loopback, private
+  networks or cloud metadata (169.254.169.254). Allow specific targets, e.g.
+  for a client in forward mode whose target is a service on this server:
+    paqctl config set EGRESS_ALLOW="127.0.0.1:80"
+    paqctl config set EGRESS_ALLOW="127.0.0.1:8080, 10.0.0.0/8, [fd00::5]:443"
+    paqctl config set EGRESS_GUARD=false  (not recommended)
+  Egress changes apply immediately, without a restart.
 EOF
             ;;
         export)  cat << 'EOF'
@@ -317,7 +324,7 @@ _paqctl() {
             esac ;;
         config)
             if [ "\$prev" = "set" ] || [[ "\$cur" == *=* ]]; then
-                COMPREPLY=( \$(compgen -W "LISTEN_PORT= SOCKS_PORT= FORWARD_PORT= REMOTE_SERVER= FORWARD_TARGET= INTERFACE= LOCAL_IP= GATEWAY_MAC= ENCRYPTION_KEY= PAQET_TCP_LOCAL_FLAG= PAQET_TCP_REMOTE_FLAG= ROUTING_MODE= KCP_MODE= KCP_MTU= KCP_CONN= KCP_SNDWND= KCP_RCVWND= GFK_SERVER_IP= GFK_AUTH_CODE= TELEGRAM_SERVER_LABEL=" -- "\$cur") )
+                COMPREPLY=( \$(compgen -W "LISTEN_PORT= SOCKS_PORT= FORWARD_PORT= REMOTE_SERVER= FORWARD_TARGET= INTERFACE= LOCAL_IP= GATEWAY_MAC= ENCRYPTION_KEY= PAQET_TCP_LOCAL_FLAG= PAQET_TCP_REMOTE_FLAG= ROUTING_MODE= KCP_MODE= KCP_MTU= KCP_CONN= KCP_SNDWND= KCP_RCVWND= GFK_SERVER_IP= GFK_AUTH_CODE= TELEGRAM_SERVER_LABEL= EGRESS_GUARD= EGRESS_ALLOW=" -- "\$cur") )
                 compopt -o nospace 2>/dev/null
             else
                 COMPREPLY=( \$(compgen -W "show edit set --reveal" -- "\$cur") )
@@ -354,7 +361,7 @@ show_completion() {
 # config show / edit / set
 #───────────────────────────────────────────────────────────────────────
 _SECRET_KEYS=" ENCRYPTION_KEY GFK_AUTH_CODE TELEGRAM_BOT_TOKEN "
-_CONFIG_SET_KEYS="LISTEN_PORT SOCKS_PORT FORWARD_PORT REMOTE_SERVER FORWARD_TARGET INTERFACE LOCAL_IP GATEWAY_MAC ENCRYPTION_KEY PAQET_TCP_LOCAL_FLAG PAQET_TCP_REMOTE_FLAG ROUTING_MODE KCP_MODE KCP_MTU KCP_CONN KCP_SNDWND KCP_RCVWND GFK_SERVER_IP GFK_AUTH_CODE TELEGRAM_SERVER_LABEL"
+_CONFIG_SET_KEYS="LISTEN_PORT SOCKS_PORT FORWARD_PORT REMOTE_SERVER FORWARD_TARGET INTERFACE LOCAL_IP GATEWAY_MAC ENCRYPTION_KEY PAQET_TCP_LOCAL_FLAG PAQET_TCP_REMOTE_FLAG ROUTING_MODE KCP_MODE KCP_MTU KCP_CONN KCP_SNDWND KCP_RCVWND GFK_SERVER_IP GFK_AUTH_CODE TELEGRAM_SERVER_LABEL EGRESS_GUARD EGRESS_ALLOW"
 
 _mask_secret() {
     local s="$1"
@@ -436,6 +443,8 @@ _config_validate() {
         GFK_SERVER_IP) _validate_ip "$v" ;;   # GFK sends raw packets to it: IPv4 only
         GFK_AUTH_CODE) [[ "$v" =~ ^[A-Za-z0-9_-]{4,128}$ ]] ;;
         TELEGRAM_SERVER_LABEL) [[ "$v" =~ ^[A-Za-z0-9\ ._-]{1,64}$ ]] ;;
+        EGRESS_GUARD) [ "$v" = true ] || [ "$v" = false ] ;;
+        EGRESS_ALLOW) [ ${#v} -le 1024 ] && _egress_valid_allow "$v" ;;
         *) return 3 ;;
     esac
 }
@@ -467,10 +476,11 @@ config_set() {
         keys+=("$k"); vals+=("$v")
     done
 
-    local needs_restart=false touches_paqet=false touches_gfk=false i
+    local needs_restart=false touches_paqet=false touches_gfk=false touches_egress=false i
     for k in "${keys[@]}"; do
         case "$k" in
             TELEGRAM_SERVER_LABEL) ;;
+            EGRESS_*) touches_egress=true ;;
             GFK_*) touches_gfk=true; needs_restart=true ;;
             *) touches_paqet=true; needs_restart=true ;;
         esac
@@ -510,6 +520,17 @@ config_set() {
         generate_gfk_config || result=1
     fi
     [ "$result" -eq 0 ] && log_success "Configuration updated"
+
+    # The egress guard is rebuilt in place (start_paqet below rebuilds it anyway)
+    if [ "$result" -eq 0 ] && [ "$touches_egress" = true ] && [ "$was_running" != true ] && [ "$ROLE" = "server" ]; then
+        local eg_rc=0
+        _egress_guard_apply || eg_rc=$?
+        case "$eg_rc" in
+            0) if _egress_guard_wanted; then log_success "Egress guard updated"; else log_warn "Egress guard removed: clients can reach this host's private networks"; fi ;;
+            2) log_info "Egress guard will be installed when paqet starts." ;;
+            *) log_error "Could not update the egress guard"; result=1 ;;
+        esac
+    fi
 
     if [ "$was_running" = true ]; then
         start_paqet || result=1

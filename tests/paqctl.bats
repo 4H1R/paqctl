@@ -297,3 +297,150 @@ load_paqctl() {
     [ "$(_levenshtein kitten sitting)" = "3" ]
     [ "$(_levenshtein same same)" = "0" ]
 }
+
+@test "egress allow-list entries are parsed and validated" {
+    load_paqctl
+    [ "$(_egress_parse_allow 127.0.0.1)" = "4|127.0.0.1|" ]
+    [ "$(_egress_parse_allow 127.0.0.1:80)" = "4|127.0.0.1|80" ]
+    [ "$(_egress_parse_allow 10.0.0.0/8)" = "4|10.0.0.0/8|" ]
+    [ "$(_egress_parse_allow 10.1.0.0/16:5432)" = "4|10.1.0.0/16|5432" ]
+    [ "$(_egress_parse_allow fd00::5)" = "6|fd00::5|" ]
+    [ "$(_egress_parse_allow fd00::/8)" = "6|fd00::/8|" ]
+    [ "$(_egress_parse_allow '[fd00::5]:443')" = "6|fd00::5|443" ]
+    [ "$(_egress_parse_allow '[fd00::/64]:443')" = "6|fd00::/64|443" ]
+    for bad in "" 256.0.0.1 10.0.0.0/33 127.0.0.1:0 127.0.0.1:70000 fd00::/129 '[fd00::5]' \
+               'fd00::1::2' example.com '127.0.0.1;reboot' '$(id)' 1.2.3.4/x; do
+        if _egress_parse_allow "$bad" >/dev/null; then echo "accepted: $bad"; return 1; fi
+    done
+    _egress_valid_allow ""
+    _egress_valid_allow "127.0.0.1:80, 10.0.0.0/8 [fd00::5]:443"
+    ! _egress_valid_allow "127.0.0.1:80, nope"
+    _config_validate EGRESS_ALLOW "127.0.0.1:80,10.0.0.0/8"
+    _config_validate EGRESS_ALLOW ""
+    ! _config_validate EGRESS_ALLOW "127.0.0.1:80 \$(id)"
+    _config_validate EGRESS_GUARD true
+    _config_validate EGRESS_GUARD false
+    ! _config_validate EGRESS_GUARD yes
+}
+
+@test "egress guard is only wanted on a paqet server that has not switched it off" {
+    load_paqctl
+    BACKEND=paqet ROLE=server; unset EGRESS_GUARD
+    _egress_guard_wanted
+    EGRESS_GUARD=false; ! _egress_guard_wanted
+    EGRESS_GUARD=true ROLE=client; ! _egress_guard_wanted
+    ROLE=server BACKEND=gfw-knocker; ! _egress_guard_wanted
+}
+
+@test "egress settings survive save/load; invalid values are ignored on load" {
+    load_paqctl
+    INSTALL_DIR="$WORK/opt"
+    ROLE=server EGRESS_GUARD=false EGRESS_ALLOW="127.0.0.1:80, 10.0.0.0/8"
+    save_settings
+    grep -qx 'EGRESS_GUARD="false"' "$WORK/opt/settings.conf"
+    grep -qx 'EGRESS_ALLOW="127.0.0.1:80, 10.0.0.0/8"' "$WORK/opt/settings.conf"
+    unset EGRESS_GUARD EGRESS_ALLOW
+    _load_settings
+    [ "$EGRESS_GUARD" = false ]
+    [ "$EGRESS_ALLOW" = "127.0.0.1:80, 10.0.0.0/8" ]
+
+    unset EGRESS_GUARD EGRESS_ALLOW
+    save_settings
+    grep -qx 'EGRESS_GUARD="true"' "$WORK/opt/settings.conf"
+
+    sed -i 's/^EGRESS_ALLOW=.*/EGRESS_ALLOW="127.0.0.1:80 nope"/; s/^EGRESS_GUARD=.*/EGRESS_GUARD="maybe"/' "$WORK/opt/settings.conf"
+    unset EGRESS_GUARD EGRESS_ALLOW
+    _load_settings
+    [ -z "${EGRESS_GUARD:-}" ]
+    [ -z "${EGRESS_ALLOW:-}" ]
+}
+
+@test "egress guard rules: published ports and DNS first, allow-list before deny, all ranges denied" {
+    load_paqctl
+    printf 'nameserver 127.0.0.53\nnameserver fe80::1%%eth0\noptions edns0\n' > "$WORK/resolv.conf"
+    _EGRESS_RESOLV_CONF="$WORK/resolv.conf"
+    EGRESS_ALLOW="127.0.0.1:80, 10.0.0.0/8, [fd00::5]:443"
+    iptables()  { echo "$*" >> "$WORK/v4"; }
+    ip6tables() { echo "$*" >> "$WORK/v6"; }
+    _egress_build_family iptables
+    _egress_build_family ip6tables
+
+    # IPv4 chain, in order
+    chain4=$(grep -- "-A PAQCTL_EGRESS " "$WORK/v4" | sed 's/^-w -A PAQCTL_EGRESS //')
+    [ "$(sed -n 1p <<< "$chain4")" = "-m conntrack --ctstate DNAT -j RETURN" ]
+    [ "$(sed -n 2p <<< "$chain4")" = "-d 127.0.0.53 -p udp --dport 53 -j RETURN" ]
+    [ "$(sed -n 3p <<< "$chain4")" = "-d 127.0.0.53 -p tcp --dport 53 -j RETURN" ]
+    [ "$(sed -n 4p <<< "$chain4")" = "-d 127.0.0.1 -p tcp --dport 80 -j RETURN" ]
+    [ "$(sed -n 5p <<< "$chain4")" = "-d 127.0.0.1 -p udp --dport 80 -j RETURN" ]
+    [ "$(sed -n 6p <<< "$chain4")" = "-d 10.0.0.0/8 -j RETURN" ]
+    for r in $_EGRESS_BLOCK4; do
+        grep -qx -- "-d $r -j PAQCTL_EGRESS_DENY" <<< "$chain4" || { echo "not denied: $r"; return 1; }
+    done
+    [ "$(tail -1 <<< "$chain4")" = "-d 240.0.0.0/4 -j PAQCTL_EGRESS_DENY" ]
+    ! grep -q fd00 "$WORK/v4"
+    grep -q -- "-A PAQCTL_EGRESS_DENY -p tcp -j REJECT --reject-with tcp-reset" "$WORK/v4"
+    grep -q -- "-A PAQCTL_EGRESS_DENY -j REJECT --reject-with icmp-admin-prohibited" "$WORK/v4"
+
+    # IPv6: zone stripped from the resolver, only v6 allow entries
+    chain6=$(grep -- "-A PAQCTL_EGRESS " "$WORK/v6" | sed 's/^-w -A PAQCTL_EGRESS //')
+    grep -qx -- "-d fe80::1 -p udp --dport 53 -j RETURN" <<< "$chain6"
+    grep -qx -- "-d fd00::5 -p tcp --dport 443 -j RETURN" <<< "$chain6"
+    ! grep -q -e 127.0.0 -e 10.0.0.0 <<< "$chain6"
+    for r in $_EGRESS_BLOCK6; do
+        grep -qx -- "-d $r -j PAQCTL_EGRESS_DENY" <<< "$chain6" || { echo "not denied: $r"; return 1; }
+    done
+    grep -q -- "--reject-with icmp6-adm-prohibited" "$WORK/v6"
+}
+
+@test "egress guard falls back to localhost DNS when resolv.conf has no nameserver" {
+    load_paqctl
+    : > "$WORK/resolv.conf"
+    _EGRESS_RESOLV_CONF="$WORK/resolv.conf"
+    [ "$(_egress_resolvers 4)" = "127.0.0.1" ]
+    [ "$(_egress_resolvers 6)" = "::1" ]
+    _EGRESS_RESOLV_CONF="$WORK/missing"
+    [ "$(_egress_resolvers 4)" = "127.0.0.1" ]
+}
+
+@test "saved firewall rules never contain the egress guard" {
+    load_paqctl
+    : > "$WORK/calls"
+    _egress_guard_active()  { true; }
+    _egress_guard_remove()  { echo remove >> "$WORK/calls"; }
+    _persist_iptables_rules_now() { echo save >> "$WORK/calls"; }
+    _egress_guard_apply()   { echo apply >> "$WORK/calls"; }
+    persist_iptables_rules
+    [ "$(tr '\n' ' ' < "$WORK/calls")" = "remove save apply " ]
+
+    : > "$WORK/calls"
+    _egress_guard_active()  { false; }
+    persist_iptables_rules
+    [ "$(tr '\n' ' ' < "$WORK/calls")" = "save " ]
+}
+
+@test "blocked connections are summarised from the kernel log" {
+    load_paqctl
+    journalctl() {
+        cat << 'LOG'
+paqctl-egress: IN= OUT=eth0 SRC=203.0.113.5 DST=169.254.169.254 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=1 DF PROTO=TCP SPT=40000 DPT=80 WINDOW=64240 RES=0x00 SYN URGP=0
+paqctl-egress: IN= OUT=eth0 SRC=203.0.113.5 DST=169.254.169.254 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=2 DF PROTO=TCP SPT=40001 DPT=80 WINDOW=64240 RES=0x00 SYN URGP=0
+paqctl-egress: IN= OUT=docker0 SRC=172.17.0.1 DST=172.17.0.2 LEN=40 TOS=0x00 PREC=0x00 TTL=64 ID=3 PROTO=UDP SPT=5000 DPT=6379 LEN=20
+unrelated kernel line DST=1.1.1.1 PROTO=TCP DPT=1
+LOG
+    }
+    out=$(_egress_recent_blocks)
+    [ "$(sed -n 1p <<< "$out" | xargs)" = "2 169.254.169.254:80 (TCP)" ]
+    [ "$(sed -n 2p <<< "$out" | xargs)" = "1 172.17.0.2:6379 (UDP)" ]
+    [ "$(wc -l <<< "$out")" -eq 2 ]
+}
+
+@test "forward mode warns when the target is on the server's private side" {
+    load_paqctl
+    [[ "$(_egress_forward_hint 127.0.0.1:80)" == *'EGRESS_ALLOW="127.0.0.1:80"'* ]]
+    [[ "$(_egress_forward_hint localhost:2053)" == *'EGRESS_ALLOW="127.0.0.1:2053"'* ]]
+    [[ "$(_egress_forward_hint 172.20.0.5:5432)" == *'EGRESS_ALLOW="172.20.0.5:5432"'* ]]
+    [[ "$(_egress_forward_hint '[::1]:8080')" == *'EGRESS_ALLOW="[::1]:8080"'* ]]
+    [ -z "$(_egress_forward_hint 203.0.113.5:443)" ]
+    [ -z "$(_egress_forward_hint example.com:443)" ]
+    [ -z "$(_egress_forward_hint 172.32.0.1:80)" ]
+}

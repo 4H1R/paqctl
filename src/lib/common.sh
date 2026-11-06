@@ -384,6 +384,19 @@ _is_firewalld_active() {
 }
 
 persist_iptables_rules() {
+    # The egress guard binds to paqet's running cgroup and cannot be restored
+    # at boot (the restore would fail as a whole): keep it out of saved rules.
+    # It is rebuilt on every service start.
+    if declare -F _egress_guard_active >/dev/null && _egress_guard_active; then
+        _egress_guard_remove
+        _persist_iptables_rules_now
+        _egress_guard_apply >/dev/null 2>&1 || true
+        return 0
+    fi
+    _persist_iptables_rules_now
+}
+
+_persist_iptables_rules_now() {
     if _is_firewalld_active; then
         firewall-cmd --runtime-to-permanent 2>/dev/null || true
         return 0
@@ -480,8 +493,12 @@ _load_settings() {
             KCP_SMUXBUF) KCP_SMUXBUF="$value" ;;
             TURBO_ENABLED) TURBO_ENABLED="$value" ;;
             WATCHDOG_ENABLED) WATCHDOG_ENABLED="$value" ;;
+            EGRESS_GUARD) [[ "$value" =~ ^(true|false)$ ]] && EGRESS_GUARD="$value" ;;
+            EGRESS_ALLOW) _egress_valid_allow "$value" && EGRESS_ALLOW="$value" ;;
         esac
     done < <(grep '^[A-Z_][A-Z_0-9]*=' "$INSTALL_DIR/settings.conf")
+    # An invalid value on the last line must not make loading "fail"
+    return 0
 }
 
 # Write settings.conf atomically from the current shell variables.
@@ -555,6 +572,8 @@ KCP_SOCKBUF="${KCP_SOCKBUF:-4194304}"
 KCP_SMUXBUF="${KCP_SMUXBUF:-4194304}"
 TURBO_ENABLED="${TURBO_ENABLED:-false}"
 WATCHDOG_ENABLED="${WATCHDOG_ENABLED:-false}"
+EGRESS_GUARD="${EGRESS_GUARD:-true}"
+EGRESS_ALLOW="${EGRESS_ALLOW:-}"
 SEOF
     )
     if ! mv "$_tmp" "$INSTALL_DIR/settings.conf"; then

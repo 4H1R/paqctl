@@ -30,7 +30,7 @@ jobs:
       - name: ShellCheck (errors)
         run: |
           shellcheck --version
-          shellcheck -S error paqctl.sh "$RUNNER_TEMP/paqctl-mgmt.sh" build.sh tests/extract-management.sh
+          shellcheck -S error paqctl.sh "$RUNNER_TEMP/paqctl-mgmt.sh" build.sh tests/extract-management.sh tests/egress-integration.sh
 
   test:
     name: CLI tests (bats)
@@ -43,3 +43,12 @@ jobs:
 
       - name: Run tests
         run: bats tests
+
+  egress:
+    name: Egress guard (real kernel, systemd)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run egress guard integration test
+        run: sudo bash tests/egress-integration.sh

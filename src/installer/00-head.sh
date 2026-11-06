@@ -37,5 +37,6 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/paqctl}"
 BACKEND="${BACKEND:-paqet}"
 #@include lib/constants.sh
 #@include lib/common.sh
+#@include lib/egress.sh
 #@include lib/backends.sh
 #@include lib/xray.sh

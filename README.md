@@ -7,7 +7,7 @@
 |_|             |_|
 ```
 
-[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](https://github.com/SamNet-dev/paqctl/releases)
+[![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)](https://github.com/SamNet-dev/paqctl/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
 [![Server](https://img.shields.io/badge/server-Linux-lightgrey.svg)](https://github.com/SamNet-dev/paqctl)
 [![Client](https://img.shields.io/badge/client-Windows%20%7C%20macOS%20%7C%20Linux-green.svg)](https://github.com/SamNet-dev/paqctl)
@@ -225,6 +225,17 @@ paqctl will add SOCKS5 on the next available port and append it automatically.
 > **Note:** The "Firewall: VIO port blocked" status message (shown in green) is **normal and correct**. It means the firewall is properly configured for GFK's raw socket to work.
 
 </details>
+
+---
+
+## 🔒 What's New in v1.3.0: Egress Guard
+
+A paqet server connects to whatever address a client asks for. Until now that included the server's own private side: services listening on `127.0.0.1`, Docker and other private networks, and the cloud provider's metadata service (`169.254.169.254`), which can hand out instance details and setup data such as initial passwords. Anyone holding the client key could reach them.
+
+- **🛡️ Blocked by default on paqet servers**: connections from paqet to loopback, private (RFC 1918), CGNAT, link-local/metadata, multicast and reserved addresses (IPv4 and IPv6) are rejected immediately. Normal internet traffic, DNS lookups, ports you publish (e.g. Docker `-p`) and the server's own public IP are unaffected, and so is every other program on the server.
+- **✅ Allow what you need**: if a client uses forward mode with a target on the server itself (e.g. a local Xray panel), allow exactly that: `sudo paqctl config set EGRESS_ALLOW="127.0.0.1:80"`. Changes apply instantly, without a restart.
+- **🩺 Visible**: `paqctl status`, `health` and the firewall menu show the guard; `paqctl doctor` proves it works and lists the private destinations it rejected in the last 24 hours.
+- **🔁 Updating installs it without a restart**; existing client sessions keep running.
 
 ---
 
@@ -1143,6 +1154,7 @@ sudo paqctl ban 203.0.113.7   # Block an IP or range (IPv4/IPv6/CIDR); survives 
 sudo paqctl unban 203.0.113.7
 sudo paqctl ban list
 sudo paqctl firewall          # Show / re-apply paqctl's firewall rules
+sudo paqctl config set EGRESS_ALLOW="127.0.0.1:80"   # Let clients reach one local service (egress guard)
 
 # Maintenance
 sudo paqctl backup            # Back up config, settings, bans and GFK certificates (keeps the newest 10)
@@ -1184,6 +1196,7 @@ sudo paqctl import - < client-string.txt
 - **Keep your VPS IP private** - Don't share it publicly
 - **Use strong encryption keys** - At least 16 characters for Paqet
 - **Keep software updated** - Run `sudo paqctl update` periodically
+- **Keep the egress guard on** - It stops clients from reaching the server's own private networks and cloud metadata. Allow single services with `EGRESS_ALLOW` instead of turning it off (`EGRESS_GUARD=false`)
 
 ---
 
@@ -1482,6 +1495,17 @@ paqctl به صورت خودکار SOCKS5 را روی پورت آزاد بعدی 
 > **توجه:** پیام وضعیت "Firewall: VIO port blocked" (که با رنگ سبز نمایش داده می‌شود) **عادی و صحیح** است. این به معنای آن است که فایروال به درستی برای کار raw socket در GFK تنظیم شده است.
 
 </details>
+
+---
+
+## 🔒 امکانات جدید نسخه v1.3.0: محافظ خروجی (Egress Guard)
+
+سرور paqet به هر آدرسی که کلاینت بخواهد وصل می‌شود. تا کنون این شامل بخش خصوصی خود سرور هم بود: سرویس‌هایی که روی `127.0.0.1` گوش می‌دهند، شبکه‌های Docker و دیگر شبکه‌های خصوصی، و سرویس متادیتای ارائه‌دهنده ابری (`169.254.169.254`) که می‌تواند اطلاعات سرور و داده‌های راه‌اندازی مثل رمز عبور اولیه را برگرداند. هر کسی که کلید کلاینت را داشت به این‌ها دسترسی داشت.
+
+- **🛡️ مسدود به صورت پیش‌فرض روی سرورهای paqet**: اتصال paqet به آدرس‌های loopback، خصوصی (RFC 1918)، CGNAT، link-local/متادیتا، multicast و رزروشده (IPv4 و IPv6) فوراً رد می‌شود. ترافیک عادی اینترنت، DNS، پورت‌هایی که منتشر کرده‌اید (مثلاً `-p` در Docker) و آی‌پی عمومی خود سرور تحت تاثیر نیستند و برنامه‌های دیگر سرور هم همین‌طور.
+- **✅ اجازه دادن به آنچه لازم دارید**: اگر کلاینتی در حالت forward به سرویسی روی خود سرور وصل می‌شود (مثلاً پنل Xray محلی)، دقیقاً همان را مجاز کنید: `sudo paqctl config set EGRESS_ALLOW="127.0.0.1:80"`. تغییرات بلافاصله و بدون ریستارت اعمال می‌شوند.
+- **🩺 قابل مشاهده**: `paqctl status`، `health` و منوی فایروال وضعیت محافظ را نشان می‌دهند؛ `paqctl doctor` کارکرد آن را آزمایش می‌کند و مقصدهای خصوصی ردشده در ۲۴ ساعت گذشته را فهرست می‌کند.
+- **🔁 به‌روزرسانی آن را بدون ریستارت نصب می‌کند**؛ نشست‌های فعلی کلاینت‌ها قطع نمی‌شوند.
 
 ---
 
@@ -2286,6 +2310,7 @@ sudo paqctl ban 203.0.113.7   # مسدودسازی آی‌پی یا رنج (IPv4
 sudo paqctl unban 203.0.113.7
 sudo paqctl ban list
 sudo paqctl firewall          # نمایش / اعمال مجدد قوانین فایروال paqctl
+sudo paqctl config set EGRESS_ALLOW="127.0.0.1:80"   # اجازه دسترسی کلاینت‌ها به یک سرویس محلی (محافظ خروجی)
 
 # نگهداری
 sudo paqctl backup            # پشتیبان از کانفیگ، تنظیمات، آی‌پی‌های مسدود و گواهی‌های GFK (۱۰ نسخه آخر نگه داشته می‌شود)
@@ -2324,6 +2349,7 @@ sudo paqctl -y rotate-key && sudo paqctl export --json | jq -r .uri
 - **آی‌پی VPS را خصوصی نگه دارید**
 - **از کلیدهای قوی استفاده کنید** - حداقل ۱۶ کاراکتر
 - **به‌روز نگه دارید** - `sudo paqctl update`
+- **محافظ خروجی را روشن نگه دارید** - جلوی دسترسی کلاینت‌ها به شبکه‌های خصوصی و متادیتای ابری سرور را می‌گیرد. به جای خاموش کردن آن (`EGRESS_GUARD=false`)، سرویس‌های مشخص را با `EGRESS_ALLOW` مجاز کنید
 
 ---
 

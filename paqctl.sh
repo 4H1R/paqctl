@@ -39,7 +39,7 @@ BACKEND="${BACKEND:-paqet}"
 # Versions, repositories and colours shared by the installer and the management script.
 # INSTALL_DIR must be set before this file is included.
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # Pinned versions for stability (update these after testing new releases)
 PAQET_VERSION_PINNED="v1.0.0-alpha.21-a1"
@@ -452,6 +452,19 @@ _is_firewalld_active() {
 }
 
 persist_iptables_rules() {
+    # The egress guard binds to paqet's running cgroup and cannot be restored
+    # at boot (the restore would fail as a whole): keep it out of saved rules.
+    # It is rebuilt on every service start.
+    if declare -F _egress_guard_active >/dev/null && _egress_guard_active; then
+        _egress_guard_remove
+        _persist_iptables_rules_now
+        _egress_guard_apply >/dev/null 2>&1 || true
+        return 0
+    fi
+    _persist_iptables_rules_now
+}
+
+_persist_iptables_rules_now() {
     if _is_firewalld_active; then
         firewall-cmd --runtime-to-permanent 2>/dev/null || true
         return 0
@@ -548,8 +561,12 @@ _load_settings() {
             KCP_SMUXBUF) KCP_SMUXBUF="$value" ;;
             TURBO_ENABLED) TURBO_ENABLED="$value" ;;
             WATCHDOG_ENABLED) WATCHDOG_ENABLED="$value" ;;
+            EGRESS_GUARD) [[ "$value" =~ ^(true|false)$ ]] && EGRESS_GUARD="$value" ;;
+            EGRESS_ALLOW) _egress_valid_allow "$value" && EGRESS_ALLOW="$value" ;;
         esac
     done < <(grep '^[A-Z_][A-Z_0-9]*=' "$INSTALL_DIR/settings.conf")
+    # An invalid value on the last line must not make loading "fail"
+    return 0
 }
 
 # Write settings.conf atomically from the current shell variables.
@@ -623,6 +640,8 @@ KCP_SOCKBUF="${KCP_SOCKBUF:-4194304}"
 KCP_SMUXBUF="${KCP_SMUXBUF:-4194304}"
 TURBO_ENABLED="${TURBO_ENABLED:-false}"
 WATCHDOG_ENABLED="${WATCHDOG_ENABLED:-false}"
+EGRESS_GUARD="${EGRESS_GUARD:-true}"
+EGRESS_ALLOW="${EGRESS_ALLOW:-}"
 SEOF
     )
     if ! mv "$_tmp" "$INSTALL_DIR/settings.conf"; then
@@ -631,6 +650,292 @@ SEOF
         return 1
     fi
     chmod 600 "$INSTALL_DIR/settings.conf" 2>/dev/null
+}
+#═══════════════════════════════════════════════════════════════════════
+# Egress guard (paqet server)
+#
+# A paqet server dials whatever address a client asks for. Without this
+# guard anyone holding the key can reach this host's loopback services, its
+# Docker/private networks and the cloud metadata service (169.254.169.254).
+#
+# The guard rejects such connections for processes in paqctl.service only
+# (iptables cgroup match). paqet's tunnel packets are injected below iptables
+# and are not affected; neither is anything else on the host.
+#
+# The cgroup match binds to the cgroup that exists when the rule is added,
+# so the rules are rebuilt on every start (ExecStartPre -> _apply_firewall)
+# and kept out of saved rulesets, where they would fail to restore at boot.
+#
+# Settings: EGRESS_GUARD=true|false (default true)
+#           EGRESS_ALLOW="127.0.0.1:80, 10.0.0.0/8, [fd00::1]:443"
+#═══════════════════════════════════════════════════════════════════════
+
+_EGRESS_CHAIN="PAQCTL_EGRESS"
+_EGRESS_DENY="PAQCTL_EGRESS_DENY"
+_EGRESS_TAG="paqctl-egress"
+_EGRESS_LOG_PREFIX="paqctl-egress: "
+_EGRESS_CGROUP="system.slice/paqctl.service"
+_EGRESS_RESOLV_CONF="/etc/resolv.conf"
+# Loopback, "this host", RFC1918, CGNAT, link-local (cloud metadata),
+# IETF/benchmark ranges, multicast and reserved
+_EGRESS_BLOCK4="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4"
+# Unspecified, loopback, link-local, site-local, unique-local, multicast
+_EGRESS_BLOCK6="::/128 ::1/128 fe80::/10 fec0::/10 fc00::/7 ff00::/8"
+
+# Is the guard wanted for this install? (paqet server, not switched off)
+_egress_guard_wanted() {
+    [ "${BACKEND:-paqet}" = "paqet" ] && [ "${ROLE:-}" = "server" ] && [ "${EGRESS_GUARD:-true}" = "true" ]
+}
+
+_egress_valid_ip6() {
+    [[ "$1" == *:* ]] && [[ "$1" =~ ^[0-9A-Fa-f:.]+$ ]] && [ ${#1} -le 45 ] || return 1
+    local rest="${1#*::}"
+    [[ "$rest" != *::* ]]   # at most one "::"
+}
+
+# _egress_parse_allow ENTRY -> "FAMILY|CIDR|PORT" (PORT may be empty); 1 if invalid
+# Accepts: 1.2.3.4  1.2.3.0/24  1.2.3.4:80  1.2.3.0/24:80  fd00::1  fd00::/8  [fd00::1]:80  [fd00::/8]:80
+_egress_parse_allow() {
+    local e="$1" addr port="" ip pfx="" fam
+    if [[ "$e" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+        addr="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    elif [[ "$e" =~ ^([0-9./]+):([0-9]+)$ ]]; then
+        addr="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    else
+        addr="$e"
+    fi
+    ip="${addr%%/*}"
+    [[ "$addr" == */* ]] && pfx="${addr#*/}"
+    if _validate_ip "$ip"; then
+        fam=4
+        [ -z "$pfx" ] || { [[ "$pfx" =~ ^[0-9]{1,2}$ ]] && [ "$pfx" -le 32 ]; } || return 1
+    elif _egress_valid_ip6 "$ip"; then
+        fam=6
+        [ -z "$pfx" ] || { [[ "$pfx" =~ ^[0-9]{1,3}$ ]] && [ "$pfx" -le 128 ]; } || return 1
+    else
+        return 1
+    fi
+    [ -z "$port" ] || _validate_port "$port" || return 1
+    printf '%s|%s|%s\n' "$fam" "$addr" "$port"
+}
+
+# EGRESS_ALLOW split on commas and whitespace
+_egress_allow_list() {
+    local list="${EGRESS_ALLOW:-}"
+    list="${list//,/ }"
+    local e
+    for e in $list; do printf '%s\n' "$e"; done
+}
+
+# Every EGRESS_ALLOW entry valid? (empty is valid)
+_egress_valid_allow() {
+    local e
+    for e in $(EGRESS_ALLOW="$1" _egress_allow_list); do
+        _egress_parse_allow "$e" >/dev/null || return 1
+    done
+    return 0
+}
+
+# DNS resolvers paqet needs to reach (they are often on loopback, e.g. 127.0.0.53)
+_egress_resolvers() {
+    local fam="$1" ns any=false
+    while read -r _ ns _; do
+        any=true
+        ns="${ns%%\%*}"
+        if [ "$fam" = 4 ] && _validate_ip "$ns"; then
+            echo "$ns"
+        elif [ "$fam" = 6 ] && _egress_valid_ip6 "$ns"; then
+            echo "$ns"
+        fi
+    done < <(grep -E '^[[:space:]]*nameserver[[:space:]]' "$_EGRESS_RESOLV_CONF" 2>/dev/null)
+    # No nameserver line: resolvers fall back to localhost
+    if [ "$any" = false ]; then
+        if [ "$fam" = 4 ]; then echo "127.0.0.1"; else echo "::1"; fi
+    fi
+}
+
+# Root of the cgroup v2 hierarchy (unified or hybrid mode)
+_egress_cgroup_root() {
+    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+        echo /sys/fs/cgroup
+    elif [ -f /sys/fs/cgroup/unified/cgroup.controllers ]; then
+        echo /sys/fs/cgroup/unified
+    else
+        return 1
+    fi
+}
+
+# _egress_build_family iptables|ip6tables  - (re)create the guard chains
+_egress_build_family() {
+    local ipt="$1" fam=4 rej="icmp-admin-prohibited" block="$_EGRESS_BLOCK4"
+    if [ "$ipt" = "ip6tables" ]; then
+        fam=6; rej="icmp6-adm-prohibited"; block="$_EGRESS_BLOCK6"
+    fi
+    local c
+    for c in "$_EGRESS_DENY" "$_EGRESS_CHAIN"; do
+        "$ipt" -w -N "$c" 2>/dev/null || "$ipt" -w -F "$c" 2>/dev/null || return 1
+    done
+
+    # Deny: log (rate-limited, for 'paqctl doctor') and fail fast
+    "$ipt" -w -A "$_EGRESS_DENY" -m limit --limit 10/min --limit-burst 20 \
+        -j LOG --log-prefix "$_EGRESS_LOG_PREFIX" --log-level info 2>/dev/null || true
+    "$ipt" -w -A "$_EGRESS_DENY" -p tcp -j REJECT --reject-with tcp-reset || return 1
+    "$ipt" -w -A "$_EGRESS_DENY" -j REJECT --reject-with "$rej" || return 1
+
+    # Published ports (e.g. Docker): the client asked for a public or local
+    # address that was DNATed to a private one - allowed, as from anywhere else
+    "$ipt" -w -A "$_EGRESS_CHAIN" -m conntrack --ctstate DNAT -j RETURN || return 1
+
+    local r proto
+    while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        for proto in udp tcp; do
+            "$ipt" -w -A "$_EGRESS_CHAIN" -d "$r" -p "$proto" --dport 53 -j RETURN || return 1
+        done
+    done < <(_egress_resolvers "$fam")
+
+    local e parsed f cidr port
+    while IFS= read -r e; do
+        parsed=$(_egress_parse_allow "$e") || continue
+        IFS='|' read -r f cidr port <<< "$parsed"
+        [ "$f" = "$fam" ] || continue
+        if [ -n "$port" ]; then
+            for proto in tcp udp; do
+                "$ipt" -w -A "$_EGRESS_CHAIN" -d "$cidr" -p "$proto" --dport "$port" -j RETURN || return 1
+            done
+        else
+            "$ipt" -w -A "$_EGRESS_CHAIN" -d "$cidr" -j RETURN || return 1
+        fi
+    done < <(_egress_allow_list)
+
+    for cidr in $block; do
+        "$ipt" -w -A "$_EGRESS_CHAIN" -d "$cidr" -j "$_EGRESS_DENY" || return 1
+    done
+}
+
+# Delete every OUTPUT jump to the guard (by number: the cgroup a stale rule
+# points to may no longer exist), then the chains
+_egress_remove_family() {
+    local ipt="$1" n
+    command -v "$ipt" &>/dev/null || return 0
+    for _ in $(seq 1 20); do
+        n=$("$ipt" -w -L OUTPUT -n --line-numbers 2>/dev/null | awk -v c="$_EGRESS_CHAIN" '$2 == c {print $1; exit}')
+        [ -n "$n" ] || break
+        "$ipt" -w -D OUTPUT "$n" 2>/dev/null || break
+    done
+    local c
+    for c in "$_EGRESS_CHAIN" "$_EGRESS_DENY"; do
+        "$ipt" -w -F "$c" 2>/dev/null || true
+        "$ipt" -w -X "$c" 2>/dev/null || true
+    done
+}
+
+_egress_guard_remove() {
+    _egress_remove_family iptables
+    _egress_remove_family ip6tables
+}
+
+# Is the guard jump in place (IPv4)?
+_egress_guard_active() {
+    command -v iptables &>/dev/null || return 1
+    iptables -w -L OUTPUT -n 2>/dev/null | awk -v c="$_EGRESS_CHAIN" '$1 == c {f = 1} END {exit !f}'
+}
+
+# Rebuild the guard, or remove it when it is not wanted.
+# Returns 0 when done (or not wanted), 2 when paqet is not running (the guard
+# is installed at the next start), 1 on failure.
+_egress_guard_apply() {
+    _egress_guard_remove
+    _egress_guard_wanted || return 0
+
+    if _is_firewalld_active; then
+        echo -e "${YELLOW}[!]${NC} Egress guard is not available with firewalld: paqet clients can reach this host's private networks." >&2
+        return 1
+    fi
+    if ! command -v iptables &>/dev/null; then
+        echo -e "${YELLOW}[!]${NC} Egress guard needs iptables." >&2
+        return 1
+    fi
+    if [ ! -d /run/systemd/system ]; then
+        echo -e "${YELLOW}[!]${NC} Egress guard needs systemd: paqet clients can reach this host's private networks." >&2
+        return 1
+    fi
+    local root
+    if ! root=$(_egress_cgroup_root); then
+        echo -e "${YELLOW}[!]${NC} Egress guard needs cgroup v2 (not available on this system)." >&2
+        return 1
+    fi
+    # The service cgroup only exists while it runs (ExecStartPre included)
+    [ -d "$root/$_EGRESS_CGROUP" ] || return 2
+    modprobe xt_cgroup 2>/dev/null || true
+
+    local ok=true
+    if _egress_build_family iptables; then
+        iptables -w -I OUTPUT 1 -m cgroup --path "$_EGRESS_CGROUP" -m comment --comment "$_EGRESS_TAG" \
+            -j "$_EGRESS_CHAIN" 2>/dev/null || ok=false
+    else
+        ok=false
+    fi
+    if command -v ip6tables &>/dev/null && [ -d /proc/sys/net/ipv6 ]; then
+        if _egress_build_family ip6tables; then
+            ip6tables -w -I OUTPUT 1 -m cgroup --path "$_EGRESS_CGROUP" -m comment --comment "$_EGRESS_TAG" \
+                -j "$_EGRESS_CHAIN" 2>/dev/null || ok=false
+        else
+            ok=false
+        fi
+    fi
+    if [ "$ok" != true ]; then
+        echo -e "${YELLOW}[!]${NC} Could not install the egress guard (iptables cgroup match unavailable?)." >&2
+        return 1
+    fi
+    return 0
+}
+
+# Prove the guard works: from inside paqet's cgroup, connect to a TCP port
+# that is reachable from outside it. Prints "blocked", "open" or "skipped".
+_egress_selftest() {
+    local root dir port
+    root=$(_egress_cgroup_root) || { echo skipped; return 0; }
+    dir="$root/$_EGRESS_CGROUP"
+    [ -w "$dir/cgroup.procs" ] || { echo skipped; return 0; }
+    # A loopback-reachable TCP listener, not DNS and not allow-listed
+    port=$(ss -Hltn 2>/dev/null | awk '{print $4}' | grep -E '^(127\.0\.0\.1|0\.0\.0\.0|\*):[0-9]+$' \
+        | sed 's/.*://' | grep -vx 53 | sort -un | head -1)
+    [ -n "$port" ] || { echo skipped; return 0; }
+    local e
+    for e in $(_egress_allow_list); do
+        case "$e" in 127.*|0.*) echo skipped; return 0 ;; esac
+    done
+    timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null || { echo skipped; return 0; }
+    # shellcheck disable=SC2016  # expanded by the inner shell
+    if timeout 3 bash -c 'echo "$BASHPID" > "$1/cgroup.procs" && exec 3<>"/dev/tcp/127.0.0.1/$2"' _ "$dir" "$port" 2>/dev/null; then
+        echo open
+    else
+        echo blocked
+    fi
+}
+
+# Client side: a forward-mode target on the server's private side (e.g. a
+# panel on its 127.0.0.1) has to be allowed on the server
+_egress_forward_hint() {
+    local target="$1" host
+    host="${target%:*}"; host="${host#[}"; host="${host%]}"
+    case "$host" in
+        localhost|127.*|0.*|10.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|\
+        100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*|::1|[fF][cCdD]*|[fF][eE]80*) ;;
+        *) return 0 ;;
+    esac
+    echo -e "  ${YELLOW}Note:${NC} paqet servers block private/loopback targets by default. Allow this one on the server:"
+    echo -e "    ${BOLD}sudo paqctl config set EGRESS_ALLOW=\"${target/localhost/127.0.0.1}\"${NC}"
+}
+
+# Connections the guard rejected recently (kernel log, rate-limited): "COUNT DST:PORT" lines
+_egress_recent_blocks() {
+    local since="${1:-24 hours ago}"
+    command -v journalctl &>/dev/null || return 0
+    journalctl -k --since "$since" --no-pager -o cat 2>/dev/null | grep -F "$_EGRESS_LOG_PREFIX" \
+        | sed -nE 's/.* DST=([^ ]+) .*PROTO=([A-Z0-9]+)( .* DPT=([0-9]+))?.*/\1:\4 (\2)/p' \
+        | sed 's/: (/ (/' | sort | uniq -c | sort -rn
 }
 # shellcheck shell=bash
 # Backend install/config helpers (paqet binary, GFW-knocker scripts).
@@ -1741,7 +2046,7 @@ _wizard_paqet() {
             echo -e "${BOLD}Local Forward Listen Port${NC} [14000]:"
             read -p "  Port: " input < /dev/tty || true; FORWARD_PORT="${input:-14000}"
             echo -e "${BOLD}Target Address (IP:PORT)${NC} [127.0.0.1:80]:"
-            read -p "  Target: " input < /dev/tty || true; FORWARD_TARGET="${input:-127.0.0.1:80}"
+            read -p "  Target: " input < /dev/tty || true; FORWARD_TARGET="${input:-127.0.0.1:80}"; _egress_forward_hint "$FORWARD_TARGET"
             SOCKS_PORT=1080
         else
             ROUTING_MODE="socks5"
@@ -2491,7 +2796,7 @@ INSTALL_DIR="REPLACE_ME_INSTALL_DIR"
 # Versions, repositories and colours shared by the installer and the management script.
 # INSTALL_DIR must be set before this file is included.
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # Pinned versions for stability (update these after testing new releases)
 PAQET_VERSION_PINNED="v1.0.0-alpha.21-a1"
@@ -2934,6 +3239,19 @@ _is_firewalld_active() {
 }
 
 persist_iptables_rules() {
+    # The egress guard binds to paqet's running cgroup and cannot be restored
+    # at boot (the restore would fail as a whole): keep it out of saved rules.
+    # It is rebuilt on every service start.
+    if declare -F _egress_guard_active >/dev/null && _egress_guard_active; then
+        _egress_guard_remove
+        _persist_iptables_rules_now
+        _egress_guard_apply >/dev/null 2>&1 || true
+        return 0
+    fi
+    _persist_iptables_rules_now
+}
+
+_persist_iptables_rules_now() {
     if _is_firewalld_active; then
         firewall-cmd --runtime-to-permanent 2>/dev/null || true
         return 0
@@ -3030,8 +3348,12 @@ _load_settings() {
             KCP_SMUXBUF) KCP_SMUXBUF="$value" ;;
             TURBO_ENABLED) TURBO_ENABLED="$value" ;;
             WATCHDOG_ENABLED) WATCHDOG_ENABLED="$value" ;;
+            EGRESS_GUARD) [[ "$value" =~ ^(true|false)$ ]] && EGRESS_GUARD="$value" ;;
+            EGRESS_ALLOW) _egress_valid_allow "$value" && EGRESS_ALLOW="$value" ;;
         esac
     done < <(grep '^[A-Z_][A-Z_0-9]*=' "$INSTALL_DIR/settings.conf")
+    # An invalid value on the last line must not make loading "fail"
+    return 0
 }
 
 # Write settings.conf atomically from the current shell variables.
@@ -3105,6 +3427,8 @@ KCP_SOCKBUF="${KCP_SOCKBUF:-4194304}"
 KCP_SMUXBUF="${KCP_SMUXBUF:-4194304}"
 TURBO_ENABLED="${TURBO_ENABLED:-false}"
 WATCHDOG_ENABLED="${WATCHDOG_ENABLED:-false}"
+EGRESS_GUARD="${EGRESS_GUARD:-true}"
+EGRESS_ALLOW="${EGRESS_ALLOW:-}"
 SEOF
     )
     if ! mv "$_tmp" "$INSTALL_DIR/settings.conf"; then
@@ -3113,6 +3437,292 @@ SEOF
         return 1
     fi
     chmod 600 "$INSTALL_DIR/settings.conf" 2>/dev/null
+}
+#═══════════════════════════════════════════════════════════════════════
+# Egress guard (paqet server)
+#
+# A paqet server dials whatever address a client asks for. Without this
+# guard anyone holding the key can reach this host's loopback services, its
+# Docker/private networks and the cloud metadata service (169.254.169.254).
+#
+# The guard rejects such connections for processes in paqctl.service only
+# (iptables cgroup match). paqet's tunnel packets are injected below iptables
+# and are not affected; neither is anything else on the host.
+#
+# The cgroup match binds to the cgroup that exists when the rule is added,
+# so the rules are rebuilt on every start (ExecStartPre -> _apply_firewall)
+# and kept out of saved rulesets, where they would fail to restore at boot.
+#
+# Settings: EGRESS_GUARD=true|false (default true)
+#           EGRESS_ALLOW="127.0.0.1:80, 10.0.0.0/8, [fd00::1]:443"
+#═══════════════════════════════════════════════════════════════════════
+
+_EGRESS_CHAIN="PAQCTL_EGRESS"
+_EGRESS_DENY="PAQCTL_EGRESS_DENY"
+_EGRESS_TAG="paqctl-egress"
+_EGRESS_LOG_PREFIX="paqctl-egress: "
+_EGRESS_CGROUP="system.slice/paqctl.service"
+_EGRESS_RESOLV_CONF="/etc/resolv.conf"
+# Loopback, "this host", RFC1918, CGNAT, link-local (cloud metadata),
+# IETF/benchmark ranges, multicast and reserved
+_EGRESS_BLOCK4="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4"
+# Unspecified, loopback, link-local, site-local, unique-local, multicast
+_EGRESS_BLOCK6="::/128 ::1/128 fe80::/10 fec0::/10 fc00::/7 ff00::/8"
+
+# Is the guard wanted for this install? (paqet server, not switched off)
+_egress_guard_wanted() {
+    [ "${BACKEND:-paqet}" = "paqet" ] && [ "${ROLE:-}" = "server" ] && [ "${EGRESS_GUARD:-true}" = "true" ]
+}
+
+_egress_valid_ip6() {
+    [[ "$1" == *:* ]] && [[ "$1" =~ ^[0-9A-Fa-f:.]+$ ]] && [ ${#1} -le 45 ] || return 1
+    local rest="${1#*::}"
+    [[ "$rest" != *::* ]]   # at most one "::"
+}
+
+# _egress_parse_allow ENTRY -> "FAMILY|CIDR|PORT" (PORT may be empty); 1 if invalid
+# Accepts: 1.2.3.4  1.2.3.0/24  1.2.3.4:80  1.2.3.0/24:80  fd00::1  fd00::/8  [fd00::1]:80  [fd00::/8]:80
+_egress_parse_allow() {
+    local e="$1" addr port="" ip pfx="" fam
+    if [[ "$e" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+        addr="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    elif [[ "$e" =~ ^([0-9./]+):([0-9]+)$ ]]; then
+        addr="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    else
+        addr="$e"
+    fi
+    ip="${addr%%/*}"
+    [[ "$addr" == */* ]] && pfx="${addr#*/}"
+    if _validate_ip "$ip"; then
+        fam=4
+        [ -z "$pfx" ] || { [[ "$pfx" =~ ^[0-9]{1,2}$ ]] && [ "$pfx" -le 32 ]; } || return 1
+    elif _egress_valid_ip6 "$ip"; then
+        fam=6
+        [ -z "$pfx" ] || { [[ "$pfx" =~ ^[0-9]{1,3}$ ]] && [ "$pfx" -le 128 ]; } || return 1
+    else
+        return 1
+    fi
+    [ -z "$port" ] || _validate_port "$port" || return 1
+    printf '%s|%s|%s\n' "$fam" "$addr" "$port"
+}
+
+# EGRESS_ALLOW split on commas and whitespace
+_egress_allow_list() {
+    local list="${EGRESS_ALLOW:-}"
+    list="${list//,/ }"
+    local e
+    for e in $list; do printf '%s\n' "$e"; done
+}
+
+# Every EGRESS_ALLOW entry valid? (empty is valid)
+_egress_valid_allow() {
+    local e
+    for e in $(EGRESS_ALLOW="$1" _egress_allow_list); do
+        _egress_parse_allow "$e" >/dev/null || return 1
+    done
+    return 0
+}
+
+# DNS resolvers paqet needs to reach (they are often on loopback, e.g. 127.0.0.53)
+_egress_resolvers() {
+    local fam="$1" ns any=false
+    while read -r _ ns _; do
+        any=true
+        ns="${ns%%\%*}"
+        if [ "$fam" = 4 ] && _validate_ip "$ns"; then
+            echo "$ns"
+        elif [ "$fam" = 6 ] && _egress_valid_ip6 "$ns"; then
+            echo "$ns"
+        fi
+    done < <(grep -E '^[[:space:]]*nameserver[[:space:]]' "$_EGRESS_RESOLV_CONF" 2>/dev/null)
+    # No nameserver line: resolvers fall back to localhost
+    if [ "$any" = false ]; then
+        if [ "$fam" = 4 ]; then echo "127.0.0.1"; else echo "::1"; fi
+    fi
+}
+
+# Root of the cgroup v2 hierarchy (unified or hybrid mode)
+_egress_cgroup_root() {
+    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+        echo /sys/fs/cgroup
+    elif [ -f /sys/fs/cgroup/unified/cgroup.controllers ]; then
+        echo /sys/fs/cgroup/unified
+    else
+        return 1
+    fi
+}
+
+# _egress_build_family iptables|ip6tables  - (re)create the guard chains
+_egress_build_family() {
+    local ipt="$1" fam=4 rej="icmp-admin-prohibited" block="$_EGRESS_BLOCK4"
+    if [ "$ipt" = "ip6tables" ]; then
+        fam=6; rej="icmp6-adm-prohibited"; block="$_EGRESS_BLOCK6"
+    fi
+    local c
+    for c in "$_EGRESS_DENY" "$_EGRESS_CHAIN"; do
+        "$ipt" -w -N "$c" 2>/dev/null || "$ipt" -w -F "$c" 2>/dev/null || return 1
+    done
+
+    # Deny: log (rate-limited, for 'paqctl doctor') and fail fast
+    "$ipt" -w -A "$_EGRESS_DENY" -m limit --limit 10/min --limit-burst 20 \
+        -j LOG --log-prefix "$_EGRESS_LOG_PREFIX" --log-level info 2>/dev/null || true
+    "$ipt" -w -A "$_EGRESS_DENY" -p tcp -j REJECT --reject-with tcp-reset || return 1
+    "$ipt" -w -A "$_EGRESS_DENY" -j REJECT --reject-with "$rej" || return 1
+
+    # Published ports (e.g. Docker): the client asked for a public or local
+    # address that was DNATed to a private one - allowed, as from anywhere else
+    "$ipt" -w -A "$_EGRESS_CHAIN" -m conntrack --ctstate DNAT -j RETURN || return 1
+
+    local r proto
+    while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        for proto in udp tcp; do
+            "$ipt" -w -A "$_EGRESS_CHAIN" -d "$r" -p "$proto" --dport 53 -j RETURN || return 1
+        done
+    done < <(_egress_resolvers "$fam")
+
+    local e parsed f cidr port
+    while IFS= read -r e; do
+        parsed=$(_egress_parse_allow "$e") || continue
+        IFS='|' read -r f cidr port <<< "$parsed"
+        [ "$f" = "$fam" ] || continue
+        if [ -n "$port" ]; then
+            for proto in tcp udp; do
+                "$ipt" -w -A "$_EGRESS_CHAIN" -d "$cidr" -p "$proto" --dport "$port" -j RETURN || return 1
+            done
+        else
+            "$ipt" -w -A "$_EGRESS_CHAIN" -d "$cidr" -j RETURN || return 1
+        fi
+    done < <(_egress_allow_list)
+
+    for cidr in $block; do
+        "$ipt" -w -A "$_EGRESS_CHAIN" -d "$cidr" -j "$_EGRESS_DENY" || return 1
+    done
+}
+
+# Delete every OUTPUT jump to the guard (by number: the cgroup a stale rule
+# points to may no longer exist), then the chains
+_egress_remove_family() {
+    local ipt="$1" n
+    command -v "$ipt" &>/dev/null || return 0
+    for _ in $(seq 1 20); do
+        n=$("$ipt" -w -L OUTPUT -n --line-numbers 2>/dev/null | awk -v c="$_EGRESS_CHAIN" '$2 == c {print $1; exit}')
+        [ -n "$n" ] || break
+        "$ipt" -w -D OUTPUT "$n" 2>/dev/null || break
+    done
+    local c
+    for c in "$_EGRESS_CHAIN" "$_EGRESS_DENY"; do
+        "$ipt" -w -F "$c" 2>/dev/null || true
+        "$ipt" -w -X "$c" 2>/dev/null || true
+    done
+}
+
+_egress_guard_remove() {
+    _egress_remove_family iptables
+    _egress_remove_family ip6tables
+}
+
+# Is the guard jump in place (IPv4)?
+_egress_guard_active() {
+    command -v iptables &>/dev/null || return 1
+    iptables -w -L OUTPUT -n 2>/dev/null | awk -v c="$_EGRESS_CHAIN" '$1 == c {f = 1} END {exit !f}'
+}
+
+# Rebuild the guard, or remove it when it is not wanted.
+# Returns 0 when done (or not wanted), 2 when paqet is not running (the guard
+# is installed at the next start), 1 on failure.
+_egress_guard_apply() {
+    _egress_guard_remove
+    _egress_guard_wanted || return 0
+
+    if _is_firewalld_active; then
+        echo -e "${YELLOW}[!]${NC} Egress guard is not available with firewalld: paqet clients can reach this host's private networks." >&2
+        return 1
+    fi
+    if ! command -v iptables &>/dev/null; then
+        echo -e "${YELLOW}[!]${NC} Egress guard needs iptables." >&2
+        return 1
+    fi
+    if [ ! -d /run/systemd/system ]; then
+        echo -e "${YELLOW}[!]${NC} Egress guard needs systemd: paqet clients can reach this host's private networks." >&2
+        return 1
+    fi
+    local root
+    if ! root=$(_egress_cgroup_root); then
+        echo -e "${YELLOW}[!]${NC} Egress guard needs cgroup v2 (not available on this system)." >&2
+        return 1
+    fi
+    # The service cgroup only exists while it runs (ExecStartPre included)
+    [ -d "$root/$_EGRESS_CGROUP" ] || return 2
+    modprobe xt_cgroup 2>/dev/null || true
+
+    local ok=true
+    if _egress_build_family iptables; then
+        iptables -w -I OUTPUT 1 -m cgroup --path "$_EGRESS_CGROUP" -m comment --comment "$_EGRESS_TAG" \
+            -j "$_EGRESS_CHAIN" 2>/dev/null || ok=false
+    else
+        ok=false
+    fi
+    if command -v ip6tables &>/dev/null && [ -d /proc/sys/net/ipv6 ]; then
+        if _egress_build_family ip6tables; then
+            ip6tables -w -I OUTPUT 1 -m cgroup --path "$_EGRESS_CGROUP" -m comment --comment "$_EGRESS_TAG" \
+                -j "$_EGRESS_CHAIN" 2>/dev/null || ok=false
+        else
+            ok=false
+        fi
+    fi
+    if [ "$ok" != true ]; then
+        echo -e "${YELLOW}[!]${NC} Could not install the egress guard (iptables cgroup match unavailable?)." >&2
+        return 1
+    fi
+    return 0
+}
+
+# Prove the guard works: from inside paqet's cgroup, connect to a TCP port
+# that is reachable from outside it. Prints "blocked", "open" or "skipped".
+_egress_selftest() {
+    local root dir port
+    root=$(_egress_cgroup_root) || { echo skipped; return 0; }
+    dir="$root/$_EGRESS_CGROUP"
+    [ -w "$dir/cgroup.procs" ] || { echo skipped; return 0; }
+    # A loopback-reachable TCP listener, not DNS and not allow-listed
+    port=$(ss -Hltn 2>/dev/null | awk '{print $4}' | grep -E '^(127\.0\.0\.1|0\.0\.0\.0|\*):[0-9]+$' \
+        | sed 's/.*://' | grep -vx 53 | sort -un | head -1)
+    [ -n "$port" ] || { echo skipped; return 0; }
+    local e
+    for e in $(_egress_allow_list); do
+        case "$e" in 127.*|0.*) echo skipped; return 0 ;; esac
+    done
+    timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null || { echo skipped; return 0; }
+    # shellcheck disable=SC2016  # expanded by the inner shell
+    if timeout 3 bash -c 'echo "$BASHPID" > "$1/cgroup.procs" && exec 3<>"/dev/tcp/127.0.0.1/$2"' _ "$dir" "$port" 2>/dev/null; then
+        echo open
+    else
+        echo blocked
+    fi
+}
+
+# Client side: a forward-mode target on the server's private side (e.g. a
+# panel on its 127.0.0.1) has to be allowed on the server
+_egress_forward_hint() {
+    local target="$1" host
+    host="${target%:*}"; host="${host#[}"; host="${host%]}"
+    case "$host" in
+        localhost|127.*|0.*|10.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|\
+        100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*|::1|[fF][cCdD]*|[fF][eE]80*) ;;
+        *) return 0 ;;
+    esac
+    echo -e "  ${YELLOW}Note:${NC} paqet servers block private/loopback targets by default. Allow this one on the server:"
+    echo -e "    ${BOLD}sudo paqctl config set EGRESS_ALLOW=\"${target/localhost/127.0.0.1}\"${NC}"
+}
+
+# Connections the guard rejected recently (kernel log, rate-limited): "COUNT DST:PORT" lines
+_egress_recent_blocks() {
+    local since="${1:-24 hours ago}"
+    command -v journalctl &>/dev/null || return 0
+    journalctl -k --since "$since" --no-pager -o cat 2>/dev/null | grep -F "$_EGRESS_LOG_PREFIX" \
+        | sed -nE 's/.* DST=([^ ]+) .*PROTO=([A-Z0-9]+)( .* DPT=([0-9]+))?.*/\1:\4 (\2)/p' \
+        | sed 's/: (/ (/' | sort | uniq -c | sort -rn
 }
 # shellcheck shell=bash
 # Backend install/config helpers (paqet binary, GFW-knocker scripts).
@@ -4584,7 +5194,7 @@ EOFCFG
                 echo -e "${BOLD}Local Forward Listen Port${NC} [14000]:"
                 read -p "  Port: " input < /dev/tty || true; FORWARD_PORT="${input:-14000}"
                 echo -e "${BOLD}Target Address (IP:PORT)${NC} [127.0.0.1:80]:"
-                read -p "  Target: " input < /dev/tty || true; FORWARD_TARGET="${input:-127.0.0.1:80}"
+                read -p "  Target: " input < /dev/tty || true; FORWARD_TARGET="${input:-127.0.0.1:80}"; _egress_forward_hint "$FORWARD_TARGET"
                 SOCKS_PORT=1080
             else
                 ROUTING_MODE="socks5"
@@ -4953,6 +5563,15 @@ _apply_firewall() {
     # IP bans are independent of backend/role; re-apply them on every start
     _reapply_bans
 
+    # Egress guard (paqet server): rebuilt on every start because it binds to
+    # the service's current cgroup; removed when not wanted (other role/backend).
+    # Never fails the start: 'paqctl health' reports a missing guard.
+    local _eg_rc=0
+    _egress_guard_apply || _eg_rc=$?
+    if [ "$_eg_rc" -eq 2 ] && [ -t 1 ]; then
+        echo -e "${DIM}  Egress guard will be installed when paqet starts.${NC}"
+    fi
+
     if [ "$BACKEND" = "gfw-knocker" ]; then
         local vio_port
         if [ "$ROLE" = "server" ]; then
@@ -5046,6 +5665,7 @@ _remove_firewall() {
     if ! _is_firewalld_active && ! command -v iptables &>/dev/null; then
         return 0
     fi
+    _egress_guard_remove
 
     if [ "$BACKEND" = "gfw-knocker" ]; then
         local vio_port
@@ -5113,6 +5733,7 @@ _remove_firewall() {
 
 # Remove ALL paqctl-tagged firewall rules (for complete uninstall)
 _remove_all_paqctl_firewall_rules() {
+    _egress_guard_remove
     # firewalld: remove paqctl-tagged direct rules
     if _is_firewalld_active; then
         local _rules
@@ -5250,7 +5871,12 @@ _status_json() {
     else
         printf '"interface":%s,"local_ip":%s,' "$(_json_str "${INTERFACE:-}")" "$(_json_str "${LOCAL_IP:-}")"
         if [ "$ROLE" = "server" ]; then
+            local eg_on=false eg_active=false
+            _egress_guard_wanted && eg_on=true
+            _egress_guard_active && eg_active=true
             printf '"listen_port":%s,' "$(_json_num "${LISTEN_PORT:-}")"
+            printf '"egress_guard":{"enabled":%s,"active":%s,"allow":%s},' \
+                "$(_json_bool "$eg_on")" "$(_json_bool "$eg_active")" "$(_json_str "${EGRESS_ALLOW:-}")"
         else
             printf '"remote_server":%s,"socks_port":%s,"routing_mode":%s,' "$(_json_str "${REMOTE_SERVER:-}")" "$(_json_num "${SOCKS_PORT:-}")" "$(_json_str "${ROUTING_MODE:-socks5}")"
         fi
@@ -5393,6 +6019,15 @@ show_status() {
                 echo -e "  Firewall:   ${GREEN}Rules active${NC}"
             else
                 echo -e "  Firewall:   ${RED}Rules missing${NC}"
+            fi
+            if ! _egress_guard_wanted; then
+                echo -e "  Egress:     ${YELLOW}Guard off${NC} ${DIM}(clients can reach private networks)${NC}"
+            elif _egress_guard_active; then
+                echo -e "  Egress:     ${GREEN}Private networks blocked${NC}${EGRESS_ALLOW:+ ${DIM}(allowed: ${EGRESS_ALLOW})${NC}}"
+            elif is_running; then
+                echo -e "  Egress:     ${RED}Guard missing${NC} ${DIM}(sudo paqctl doctor --fix)${NC}"
+            else
+                echo -e "  Egress:     ${DIM}Guard installed on start${NC}"
             fi
         else
             echo -e "  Server:     ${REMOTE_SERVER}"
@@ -5650,6 +6285,19 @@ _run_health_checks() {
             else
                 _hc fail "iptables RST DROP rule missing" "Apply firewall rules: sudo paqctl firewall (option 1)" firewall
             fi
+            if ! _egress_guard_wanted; then
+                _hc warn "Egress guard is off: clients can reach this host's loopback, private networks and cloud metadata" \
+                    "Turn it on: sudo paqctl config set EGRESS_GUARD=true"
+            elif _is_firewalld_active; then
+                _hc warn "Egress guard is not available with firewalld: clients can reach this host's private networks"
+            elif [ ! -d /run/systemd/system ]; then
+                _hc warn "Egress guard needs systemd: clients can reach this host's private networks"
+            elif _egress_guard_active; then
+                _hc ok "Egress guard on (clients cannot reach private/loopback/metadata addresses)"
+            elif is_running; then
+                _hc fail "Egress guard missing: clients can reach this host's private networks" \
+                    "Apply firewall rules: sudo paqctl doctor --fix" firewall
+            fi
             if is_running; then
                 if ss -tlnp 2>/dev/null | grep -q ":${LISTEN_PORT}"; then
                     _hc ok "Port $LISTEN_PORT is listening"
@@ -5754,6 +6402,21 @@ _run_doctor_checks() {
             if ss -tlnp 2>/dev/null | grep -qE "[:.]${SOCKS_PORT:-1080}[[:space:]]"; then
                 _hc fail "SOCKS5 port ${SOCKS_PORT:-1080} is already used by another process" \
                     "Free the port (ss -tlnp | grep :${SOCKS_PORT:-1080}) or pick another: sudo paqctl config set SOCKS_PORT=<port>"
+            fi
+        fi
+
+        if [ "$ROLE" = "server" ] && _egress_guard_wanted && _egress_guard_active && is_running; then
+            case "$(_egress_selftest)" in
+                blocked) _hc ok "Egress guard verified (paqet's connection to 127.0.0.1 was rejected)" ;;
+                open)    _hc fail "Egress guard is not blocking paqet (stale rule?)" \
+                             "Rebuild it: sudo paqctl doctor --fix (or sudo paqctl restart)" firewall ;;
+            esac
+            local _blocks _nblk
+            _blocks=$(_egress_recent_blocks "24 hours ago")
+            if [ -n "$_blocks" ]; then
+                _nblk=$(awk '{s += $1} END {print s + 0}' <<< "$_blocks")
+                _hc info "Egress guard rejected ${_nblk}+ connection(s) in 24h; top: $(head -3 <<< "$_blocks" | awk '{c=$1; $1=""; printf "%s%s (x%s)", (NR>1?", ":""), substr($0,2), c}')" \
+                    "If a client really needs one of these, allow it: sudo paqctl config set EGRESS_ALLOW=\"127.0.0.1:80\" (see: paqctl help config)"
             fi
         fi
 
@@ -6440,6 +7103,17 @@ show_firewall() {
                     iptables -t mangle -C OUTPUT -p tcp --sport "$port" -m comment --comment "paqctl" --tcp-flags RST RST -j DROP 2>/dev/null \
                         && echo -e "  ${GREEN}✓${NC} RST DROP (sport $port)" \
                         || echo -e "  ${RED}✗${NC} RST DROP (sport $port)  ${DIM}MISSING${NC}"
+                fi
+                echo ""
+                if ! _egress_guard_wanted; then
+                    echo -e "  ${YELLOW}!${NC} Egress guard OFF  ${DIM}(sudo paqctl config set EGRESS_GUARD=true)${NC}"
+                elif _egress_guard_active; then
+                    echo -e "  ${GREEN}✓${NC} Egress guard (paqet cannot reach private/loopback/metadata addresses)"
+                    [ -n "${EGRESS_ALLOW:-}" ] && echo -e "    ${DIM}Allowed: ${EGRESS_ALLOW}${NC}"
+                elif is_running; then
+                    echo -e "  ${RED}✗${NC} Egress guard  ${DIM}MISSING${NC}"
+                else
+                    echo -e "  ${DIM}• Egress guard is installed when paqet starts${NC}"
                 fi
             fi
 
@@ -8718,7 +9392,7 @@ _install_paqet_components() {
                 echo -e "${BOLD}Local Forward Listen Port${NC} [14000]:"
                 read -p "  Port: " input < /dev/tty || true; FORWARD_PORT="${input:-14000}"
                 echo -e "${BOLD}Target Address (IP:PORT)${NC} [127.0.0.1:80]:"
-                read -p "  Target: " input < /dev/tty || true; FORWARD_TARGET="${input:-127.0.0.1:80}"
+                read -p "  Target: " input < /dev/tty || true; FORWARD_TARGET="${input:-127.0.0.1:80}"; _egress_forward_hint "$FORWARD_TARGET"
                 SOCKS_PORT=1080
             else
                 ROUTING_MODE="socks5"
@@ -9098,11 +9772,18 @@ EOF
     LISTEN_PORT SOCKS_PORT FORWARD_PORT REMOTE_SERVER FORWARD_TARGET INTERFACE
     LOCAL_IP GATEWAY_MAC ENCRYPTION_KEY PAQET_TCP_LOCAL_FLAG PAQET_TCP_REMOTE_FLAG
     ROUTING_MODE KCP_MODE KCP_MTU KCP_CONN KCP_SNDWND KCP_RCVWND GFK_SERVER_IP GFK_AUTH_CODE
-    TELEGRAM_SERVER_LABEL
+    TELEGRAM_SERVER_LABEL EGRESS_GUARD EGRESS_ALLOW
   Examples:
     paqctl config set LISTEN_PORT=9443
     paqctl config set KCP_MTU=1200 SOCKS_PORT=1081
     paqctl config set KCP_MODE=fast2      (normal, fast, fast2, fast3 or manual)
+  Egress guard (server): clients cannot reach this host's loopback, private
+  networks or cloud metadata (169.254.169.254). Allow specific targets, e.g.
+  for a client in forward mode whose target is a service on this server:
+    paqctl config set EGRESS_ALLOW="127.0.0.1:80"
+    paqctl config set EGRESS_ALLOW="127.0.0.1:8080, 10.0.0.0/8, [fd00::5]:443"
+    paqctl config set EGRESS_GUARD=false  (not recommended)
+  Egress changes apply immediately, without a restart.
 EOF
             ;;
         export)  cat << 'EOF'
@@ -9231,7 +9912,7 @@ _paqctl() {
             esac ;;
         config)
             if [ "\$prev" = "set" ] || [[ "\$cur" == *=* ]]; then
-                COMPREPLY=( \$(compgen -W "LISTEN_PORT= SOCKS_PORT= FORWARD_PORT= REMOTE_SERVER= FORWARD_TARGET= INTERFACE= LOCAL_IP= GATEWAY_MAC= ENCRYPTION_KEY= PAQET_TCP_LOCAL_FLAG= PAQET_TCP_REMOTE_FLAG= ROUTING_MODE= KCP_MODE= KCP_MTU= KCP_CONN= KCP_SNDWND= KCP_RCVWND= GFK_SERVER_IP= GFK_AUTH_CODE= TELEGRAM_SERVER_LABEL=" -- "\$cur") )
+                COMPREPLY=( \$(compgen -W "LISTEN_PORT= SOCKS_PORT= FORWARD_PORT= REMOTE_SERVER= FORWARD_TARGET= INTERFACE= LOCAL_IP= GATEWAY_MAC= ENCRYPTION_KEY= PAQET_TCP_LOCAL_FLAG= PAQET_TCP_REMOTE_FLAG= ROUTING_MODE= KCP_MODE= KCP_MTU= KCP_CONN= KCP_SNDWND= KCP_RCVWND= GFK_SERVER_IP= GFK_AUTH_CODE= TELEGRAM_SERVER_LABEL= EGRESS_GUARD= EGRESS_ALLOW=" -- "\$cur") )
                 compopt -o nospace 2>/dev/null
             else
                 COMPREPLY=( \$(compgen -W "show edit set --reveal" -- "\$cur") )
@@ -9268,7 +9949,7 @@ show_completion() {
 # config show / edit / set
 #───────────────────────────────────────────────────────────────────────
 _SECRET_KEYS=" ENCRYPTION_KEY GFK_AUTH_CODE TELEGRAM_BOT_TOKEN "
-_CONFIG_SET_KEYS="LISTEN_PORT SOCKS_PORT FORWARD_PORT REMOTE_SERVER FORWARD_TARGET INTERFACE LOCAL_IP GATEWAY_MAC ENCRYPTION_KEY PAQET_TCP_LOCAL_FLAG PAQET_TCP_REMOTE_FLAG ROUTING_MODE KCP_MODE KCP_MTU KCP_CONN KCP_SNDWND KCP_RCVWND GFK_SERVER_IP GFK_AUTH_CODE TELEGRAM_SERVER_LABEL"
+_CONFIG_SET_KEYS="LISTEN_PORT SOCKS_PORT FORWARD_PORT REMOTE_SERVER FORWARD_TARGET INTERFACE LOCAL_IP GATEWAY_MAC ENCRYPTION_KEY PAQET_TCP_LOCAL_FLAG PAQET_TCP_REMOTE_FLAG ROUTING_MODE KCP_MODE KCP_MTU KCP_CONN KCP_SNDWND KCP_RCVWND GFK_SERVER_IP GFK_AUTH_CODE TELEGRAM_SERVER_LABEL EGRESS_GUARD EGRESS_ALLOW"
 
 _mask_secret() {
     local s="$1"
@@ -9350,6 +10031,8 @@ _config_validate() {
         GFK_SERVER_IP) _validate_ip "$v" ;;   # GFK sends raw packets to it: IPv4 only
         GFK_AUTH_CODE) [[ "$v" =~ ^[A-Za-z0-9_-]{4,128}$ ]] ;;
         TELEGRAM_SERVER_LABEL) [[ "$v" =~ ^[A-Za-z0-9\ ._-]{1,64}$ ]] ;;
+        EGRESS_GUARD) [ "$v" = true ] || [ "$v" = false ] ;;
+        EGRESS_ALLOW) [ ${#v} -le 1024 ] && _egress_valid_allow "$v" ;;
         *) return 3 ;;
     esac
 }
@@ -9381,10 +10064,11 @@ config_set() {
         keys+=("$k"); vals+=("$v")
     done
 
-    local needs_restart=false touches_paqet=false touches_gfk=false i
+    local needs_restart=false touches_paqet=false touches_gfk=false touches_egress=false i
     for k in "${keys[@]}"; do
         case "$k" in
             TELEGRAM_SERVER_LABEL) ;;
+            EGRESS_*) touches_egress=true ;;
             GFK_*) touches_gfk=true; needs_restart=true ;;
             *) touches_paqet=true; needs_restart=true ;;
         esac
@@ -9424,6 +10108,17 @@ config_set() {
         generate_gfk_config || result=1
     fi
     [ "$result" -eq 0 ] && log_success "Configuration updated"
+
+    # The egress guard is rebuilt in place (start_paqet below rebuilds it anyway)
+    if [ "$result" -eq 0 ] && [ "$touches_egress" = true ] && [ "$was_running" != true ] && [ "$ROLE" = "server" ]; then
+        local eg_rc=0
+        _egress_guard_apply || eg_rc=$?
+        case "$eg_rc" in
+            0) if _egress_guard_wanted; then log_success "Egress guard updated"; else log_warn "Egress guard removed: clients can reach this host's private networks"; fi ;;
+            2) log_info "Egress guard will be installed when paqet starts." ;;
+            *) log_error "Could not update the egress guard"; result=1 ;;
+        esac
+    fi
 
     if [ "$was_running" = true ]; then
         start_paqet || result=1
@@ -10516,6 +11211,12 @@ if [ "${1:-}" = "--update-components" ]; then
     INSTALL_DIR="${INSTALL_DIR:-/opt/paqctl}"
     _load_settings
     create_management_script
+    # Bring firewall rules up to date for the running service (e.g. install
+    # the egress guard after an upgrade) without restarting it
+    if [ "${ROLE:-}" = "server" ] && command -v systemctl &>/dev/null && \
+       systemctl is-active --quiet paqctl.service 2>/dev/null; then
+        /usr/local/bin/paqctl _apply-firewall >/dev/null 2>&1 || true
+    fi
     exit 0
 fi
 
@@ -10557,7 +11258,8 @@ main() {
         _load_settings TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID TELEGRAM_INTERVAL TELEGRAM_ENABLED \
             TELEGRAM_ALERTS_ENABLED TELEGRAM_DAILY_SUMMARY TELEGRAM_WEEKLY_SUMMARY \
             TELEGRAM_SERVER_LABEL TELEGRAM_START_HOUR \
-            KCP_NODELAY KCP_INTERVAL KCP_RESEND KCP_NOCONGESTION KCP_SOCKBUF KCP_SMUXBUF
+            KCP_NODELAY KCP_INTERVAL KCP_RESEND KCP_NOCONGESTION KCP_SOCKBUF KCP_SMUXBUF \
+            EGRESS_GUARD EGRESS_ALLOW
     fi
 
     # Step 3: Configuration wizard (determines backend + role + config)
