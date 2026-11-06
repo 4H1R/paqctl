@@ -483,7 +483,8 @@ _run_health_checks() {
             fi
         fi
 
-        if is_running && [ -x "$INSTALL_DIR/bin/paqet" ]; then
+        # paqet ping is a client-side test (it needs a client config)
+        if [ "$ROLE" = "client" ] && is_running && [ -x "$INSTALL_DIR/bin/paqet" ]; then
             [ "$JSON_OUTPUT" = true ] || [ "$_HC_QUIET" = true ] || echo -e "  ${DIM}Running paqet ping test...${NC}"
             local ping_result
             ping_result=$(timeout 10 "$INSTALL_DIR/bin/paqet" ping -c "$INSTALL_DIR/config.yaml" 2>&1 || true)

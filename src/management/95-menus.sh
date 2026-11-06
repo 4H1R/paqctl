@@ -16,6 +16,11 @@ run_ping() {
         log_error "config.yaml not found. Run: sudo paqctl config"
         return 1
     fi
+    if [ "$ROLE" = "server" ]; then
+        log_warn "paqet ping tests the connection from a client to its server; run it on a client."
+        log_info "On this server, use: sudo paqctl health (or doctor)"
+        return 0
+    fi
     log_info "Running paqet ping (Ctrl+C to stop)..."
     echo ""
     "$INSTALL_DIR/bin/paqet" ping -c "$INSTALL_DIR/config.yaml" 2>&1 || true

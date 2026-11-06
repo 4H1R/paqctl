@@ -237,6 +237,54 @@ load_paqctl() {
     run _config_validate BACKEND paqet;          [ "$status" -eq 3 ]
 }
 
+@test "YAML escaping never adds quotes and escapes \\ and \"" {
+    load_paqctl
+    [ "$(_escape_yaml 'plain')" = 'plain' ]
+    [ "$(_escape_yaml 'a:b #c')" = 'a:b #c' ]
+    [ "$(_escape_yaml 'say "hi"')" = 'say \"hi\"' ]
+    [ "$(_escape_yaml 'back\slash')" = 'back\\slash' ]
+    [ "$(_escape_yaml ' lead')" = ' lead' ]
+}
+
+@test "config.yaml keeps the existing KCP mode and only writes manual params in manual mode" {
+    load_paqctl
+    INSTALL_DIR="$WORK/opt"
+    ROLE=server LISTEN_PORT=8443 INTERFACE=eth0 LOCAL_IP=203.0.113.5 GATEWAY_MAC=aa:bb:cc:dd:ee:ff
+    ENCRYPTION_KEY=0123456789abcdef KCP_SOCKBUF=4194304 KCP_CONN=8
+    unset KCP_MODE
+
+    # no config yet -> default "fast"
+    generate_paqet_yaml "$WORK/opt/config.yaml"
+    grep -q '^    mode: "fast"$' "$WORK/opt/config.yaml"
+    ! grep -q 'nodelay:' "$WORK/opt/config.yaml"
+    # sockbuf belongs to network.pcap, never to transport.kcp; conn is not a server key
+    awk '/^  pcap:/{p=1;next} p&&/^    sockbuf:/{found=1} /^[^ ]/{p=0} END{exit !found}' "$WORK/opt/config.yaml"
+    ! awk '/^  kcp:/{k=1;next} k&&/^    (sockbuf|conn):/{bad=1} END{exit !bad}' "$WORK/opt/config.yaml"
+
+    # an existing fast2 config stays fast2 when regenerated
+    sed -i 's/mode: "fast"/mode: "fast2"/' "$WORK/opt/config.yaml"
+    generate_paqet_yaml "$WORK/opt/new.yaml"
+    grep -q '^    mode: "fast2"$' "$WORK/opt/new.yaml"
+
+    # an explicit KCP_MODE wins; manual writes the tuning knobs
+    KCP_MODE=manual KCP_NODELAY=1 KCP_INTERVAL=10 KCP_RESEND=2 KCP_NOCONGESTION=1
+    generate_paqet_yaml "$WORK/opt/manual.yaml"
+    grep -q '^    mode: "manual"$' "$WORK/opt/manual.yaml"
+    grep -q '^    nodelay: 1$' "$WORK/opt/manual.yaml"
+    grep -q '^    interval: 10$' "$WORK/opt/manual.yaml"
+
+    # garbage mode falls back to fast
+    KCP_MODE=turbo generate_paqet_yaml "$WORK/opt/bad.yaml"
+    grep -q '^    mode: "fast"$' "$WORK/opt/bad.yaml"
+}
+
+@test "config set accepts the KCP modes paqet supports" {
+    load_paqctl
+    for m in normal fast fast2 fast3 manual; do _config_validate KCP_MODE "$m"; done
+    run _config_validate KCP_MODE turbo
+    [ "$status" -eq 1 ]
+}
+
 @test "secrets are masked" {
     load_paqctl
     [ "$(_mask_secret 0123456789abcdef)" = "0123****ef" ]

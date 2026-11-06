@@ -183,11 +183,12 @@ EOF
   Settable keys:
     LISTEN_PORT SOCKS_PORT FORWARD_PORT REMOTE_SERVER FORWARD_TARGET INTERFACE
     LOCAL_IP GATEWAY_MAC ENCRYPTION_KEY PAQET_TCP_LOCAL_FLAG PAQET_TCP_REMOTE_FLAG
-    ROUTING_MODE KCP_MTU KCP_CONN KCP_SNDWND KCP_RCVWND GFK_SERVER_IP GFK_AUTH_CODE
+    ROUTING_MODE KCP_MODE KCP_MTU KCP_CONN KCP_SNDWND KCP_RCVWND GFK_SERVER_IP GFK_AUTH_CODE
     TELEGRAM_SERVER_LABEL
   Examples:
     paqctl config set LISTEN_PORT=9443
     paqctl config set KCP_MTU=1200 SOCKS_PORT=1081
+    paqctl config set KCP_MODE=fast2      (normal, fast, fast2, fast3 or manual)
 EOF
             ;;
         export)  cat << 'EOF'
@@ -316,7 +317,7 @@ _paqctl() {
             esac ;;
         config)
             if [ "\$prev" = "set" ] || [[ "\$cur" == *=* ]]; then
-                COMPREPLY=( \$(compgen -W "LISTEN_PORT= SOCKS_PORT= FORWARD_PORT= REMOTE_SERVER= FORWARD_TARGET= INTERFACE= LOCAL_IP= GATEWAY_MAC= ENCRYPTION_KEY= PAQET_TCP_LOCAL_FLAG= PAQET_TCP_REMOTE_FLAG= ROUTING_MODE= KCP_MTU= KCP_CONN= KCP_SNDWND= KCP_RCVWND= GFK_SERVER_IP= GFK_AUTH_CODE= TELEGRAM_SERVER_LABEL=" -- "\$cur") )
+                COMPREPLY=( \$(compgen -W "LISTEN_PORT= SOCKS_PORT= FORWARD_PORT= REMOTE_SERVER= FORWARD_TARGET= INTERFACE= LOCAL_IP= GATEWAY_MAC= ENCRYPTION_KEY= PAQET_TCP_LOCAL_FLAG= PAQET_TCP_REMOTE_FLAG= ROUTING_MODE= KCP_MODE= KCP_MTU= KCP_CONN= KCP_SNDWND= KCP_RCVWND= GFK_SERVER_IP= GFK_AUTH_CODE= TELEGRAM_SERVER_LABEL=" -- "\$cur") )
                 compopt -o nospace 2>/dev/null
             else
                 COMPREPLY=( \$(compgen -W "show edit set --reveal" -- "\$cur") )
@@ -353,7 +354,7 @@ show_completion() {
 # config show / edit / set
 #───────────────────────────────────────────────────────────────────────
 _SECRET_KEYS=" ENCRYPTION_KEY GFK_AUTH_CODE TELEGRAM_BOT_TOKEN "
-_CONFIG_SET_KEYS="LISTEN_PORT SOCKS_PORT FORWARD_PORT REMOTE_SERVER FORWARD_TARGET INTERFACE LOCAL_IP GATEWAY_MAC ENCRYPTION_KEY PAQET_TCP_LOCAL_FLAG PAQET_TCP_REMOTE_FLAG ROUTING_MODE KCP_MTU KCP_CONN KCP_SNDWND KCP_RCVWND GFK_SERVER_IP GFK_AUTH_CODE TELEGRAM_SERVER_LABEL"
+_CONFIG_SET_KEYS="LISTEN_PORT SOCKS_PORT FORWARD_PORT REMOTE_SERVER FORWARD_TARGET INTERFACE LOCAL_IP GATEWAY_MAC ENCRYPTION_KEY PAQET_TCP_LOCAL_FLAG PAQET_TCP_REMOTE_FLAG ROUTING_MODE KCP_MODE KCP_MTU KCP_CONN KCP_SNDWND KCP_RCVWND GFK_SERVER_IP GFK_AUTH_CODE TELEGRAM_SERVER_LABEL"
 
 _mask_secret() {
     local s="$1"
@@ -429,6 +430,7 @@ _config_validate() {
         PAQET_TCP_LOCAL_FLAG|PAQET_TCP_REMOTE_FLAG) [[ "$v" =~ ^[FSRPAUEC]+(,[FSRPAUEC]+)*$ ]] ;;
         ROUTING_MODE) [ "$v" = "socks5" ] || [ "$v" = "forward" ] ;;
         KCP_MTU) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 500 ] && [ "$v" -le 9000 ] ;;
+        KCP_MODE) [[ "$v" =~ ^(normal|fast|fast2|fast3|manual)$ ]] ;;
         KCP_CONN) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 64 ] ;;
         KCP_SNDWND|KCP_RCVWND) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 16 ] && [ "$v" -le 65535 ] ;;
         GFK_SERVER_IP) _validate_ip "$v" ;;   # GFK sends raw packets to it: IPv4 only

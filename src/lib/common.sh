@@ -239,6 +239,143 @@ install_package() {
 }
 
 #═══════════════════════════════════════════════════════════════════════
+# paqet config.yaml
+#═══════════════════════════════════════════════════════════════════════
+
+# Escape a value for use inside a double-quoted YAML string. Callers always
+# write the quotes themselves, so this never adds any.
+_escape_yaml() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/}"
+    s="${s//$'\r'/}"
+    printf '%s' "$s"
+}
+
+# KCP mode in the current config.yaml (transport.kcp.mode), if any
+_current_kcp_mode() {
+    [ -f "$INSTALL_DIR/config.yaml" ] || return 0
+    awk '/^  kcp:/{k=1; next} k && /^[^ ]|^  [^ ]/{k=0} k && /^    mode:/{gsub(/["\047]/, "", $2); print $2; exit}' "$INSTALL_DIR/config.yaml" 2>/dev/null || true
+}
+
+generate_paqet_yaml() {
+    local target_file="$1"
+    local _y_iface _y_ip _y_mac _y_key _y_server _tcp_local_flags _tcp_remote_flags
+    _y_iface=$(_escape_yaml "${INTERFACE:-${IFACE:-eth0}}")
+    _y_ip=$(_escape_yaml "${LOCAL_IP:-}")
+    _y_mac=$(_escape_yaml "${GATEWAY_MAC:-${GW_MAC:-}}")
+    _y_key=$(_escape_yaml "${ENCRYPTION_KEY:-${KEY:-}}")
+    _tcp_local_flags=$(echo "${PAQET_TCP_LOCAL_FLAG:-PA}" | sed 's/,/", "/g; s/.*/["&"]/')
+    _tcp_remote_flags=$(echo "${PAQET_TCP_REMOTE_FLAG:-PA}" | sed 's/,/", "/g; s/.*/["&"]/')
+
+    # KCP mode: setting > mode already in config.yaml > "fast". Keeping the
+    # current mode means regenerating (config set, rotate-key, import...) never
+    # silently changes how an existing server behaves.
+    local _mode="${KCP_MODE:-}"
+    [ -n "$_mode" ] || _mode=$(_current_kcp_mode)
+    case "$_mode" in normal|fast|fast2|fast3|manual) ;; *) _mode="fast" ;; esac
+    # nodelay/interval/resend/nocongestion only take effect in manual mode
+    local _manual=""
+    if [ "$_mode" = "manual" ]; then
+        _manual="
+    nodelay: ${KCP_NODELAY:-0}
+    interval: ${KCP_INTERVAL:-20}
+    resend: ${KCP_RESEND:-2}
+    nocongestion: ${KCP_NOCONGESTION:-0}"
+    fi
+
+    local _conn="${KCP_CONN:-2}"
+    local _mtu="${KCP_MTU:-1350}"
+    local _sndwnd="${KCP_SNDWND:-1024}"
+    local _rcvwnd="${KCP_RCVWND:-1024}"
+    local _nodelay="${KCP_NODELAY:-0}"
+    local _interval="${KCP_INTERVAL:-20}"
+    local _resend="${KCP_RESEND:-2}"
+    local _nocongestion="${KCP_NOCONGESTION:-0}"
+    local _sockbuf="${KCP_SOCKBUF:-4194304}"
+    local _smuxbuf="${KCP_SMUXBUF:-4194304}"
+
+    if [ "$ROLE" = "server" ]; then
+        cat > "$target_file" << EOF
+role: "server"
+
+log:
+  level: "info"
+
+listen:
+  addr: ":${LISTEN_PORT:-8443}"
+
+network:
+  interface: "${_y_iface}"
+  ipv4:
+    addr: "${_y_ip}:${LISTEN_PORT:-8443}"
+    router_mac: "${_y_mac}"
+  tcp:
+    local_flag: ${_tcp_local_flags}
+    remote_flag: ${_tcp_remote_flags}
+  pcap:
+    sockbuf: $(( _sockbuf > 8388608 ? _sockbuf : 8388608 ))
+
+transport:
+  protocol: "kcp"
+  kcp:
+    mode: "${_mode}"${_manual}
+    key: "${_y_key}"
+    mtu: ${_mtu}
+    sndwnd: ${_sndwnd}
+    rcvwnd: ${_rcvwnd}
+    smuxbuf: ${_smuxbuf}
+EOF
+    else
+        _y_server=$(_escape_yaml "${REMOTE_SERVER:-}")
+        local _routing_section=""
+        if [ "${ROUTING_MODE:-socks5}" = "forward" ]; then
+            _routing_section="forward:
+  - listen: \"0.0.0.0:${FORWARD_PORT:-14000}\"
+    target: \"${FORWARD_TARGET:-127.0.0.1:80}\""
+        else
+            _routing_section="socks5:
+  - listen: \"127.0.0.1:${SOCKS_PORT:-1080}\""
+        fi
+
+        cat > "$target_file" << EOF
+role: "client"
+
+log:
+  level: "info"
+
+${_routing_section}
+
+network:
+  interface: "${_y_iface}"
+  ipv4:
+    addr: "${_y_ip}:0"
+    router_mac: "${_y_mac}"
+  tcp:
+    local_flag: ${_tcp_local_flags}
+    remote_flag: ${_tcp_remote_flags}
+  pcap:
+    sockbuf: ${_sockbuf}
+
+server:
+  addr: "${_y_server}"
+
+transport:
+  protocol: "kcp"
+  conn: ${_conn}
+  kcp:
+    mode: "${_mode}"${_manual}
+    key: "${_y_key}"
+    mtu: ${_mtu}
+    sndwnd: ${_sndwnd}
+    rcvwnd: ${_rcvwnd}
+    smuxbuf: ${_smuxbuf}
+EOF
+    fi
+}
+
+#═══════════════════════════════════════════════════════════════════════
 # Firewall persistence
 #═══════════════════════════════════════════════════════════════════════
 
@@ -330,6 +467,7 @@ _load_settings() {
             FORWARD_PORT) FORWARD_PORT="$value" ;;
             FORWARD_TARGET) FORWARD_TARGET="$value" ;;
             KCP_PROFILE) KCP_PROFILE="$value" ;;
+            KCP_MODE) [[ "$value" =~ ^(normal|fast|fast2|fast3|manual)?$ ]] && KCP_MODE="$value" ;;
             KCP_CONN) KCP_CONN="$value" ;;
             KCP_MTU) KCP_MTU="$value" ;;
             KCP_SNDWND) KCP_SNDWND="$value" ;;
@@ -404,6 +542,7 @@ ROUTING_MODE="${ROUTING_MODE:-socks5}"
 FORWARD_PORT="${FORWARD_PORT:-14000}"
 FORWARD_TARGET="${FORWARD_TARGET:-127.0.0.1:80}"
 KCP_PROFILE="${KCP_PROFILE:-standard}"
+KCP_MODE="${KCP_MODE:-}"
 KCP_CONN="${KCP_CONN:-2}"
 KCP_MTU="${KCP_MTU:-1350}"
 KCP_SNDWND="${KCP_SNDWND:-1024}"
