@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Syntax & ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract embedded management script
+        run: bash tests/extract-management.sh paqctl.sh > "$RUNNER_TEMP/paqctl-mgmt.sh"
+
+      - name: bash -n
+        run: |
+          bash -n paqctl.sh
+          bash -n "$RUNNER_TEMP/paqctl-mgmt.sh"
+
+      - name: ShellCheck (errors)
+        run: |
+          shellcheck --version
+          shellcheck -S error paqctl.sh "$RUNNER_TEMP/paqctl-mgmt.sh" tests/extract-management.sh
+
+  test:
+    name: CLI tests (bats)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bats
+
+      - name: Run tests
+        run: bats tests

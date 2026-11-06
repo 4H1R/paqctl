@@ -7,7 +7,7 @@
 |_|             |_|
 ```
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/SamNet-dev/paqctl/releases)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](https://github.com/SamNet-dev/paqctl/releases)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
 [![Server](https://img.shields.io/badge/server-Linux-lightgrey.svg)](https://github.com/SamNet-dev/paqctl)
 [![Client](https://img.shields.io/badge/client-Windows%20%7C%20macOS%20%7C%20Linux-green.svg)](https://github.com/SamNet-dev/paqctl)
@@ -225,6 +225,22 @@ paqctl will add SOCKS5 on the next available port and append it automatically.
 > **Note:** The "Firewall: VIO port blocked" status message (shown in green) is **normal and correct**. It means the firewall is properly configured for GFK's raw socket to work.
 
 </details>
+
+---
+
+## 🧰 What's New in v1.2.0: A Better Command Line
+
+- **🩺 `paqctl doctor`**: health checks plus a concrete fix for every problem (changed interface/IP/gateway MAC, MTU, port conflicts, missing firewall rules, config drift). `doctor --fix` applies the safe fixes for you.
+- **🧪 `paqctl test`**: sends a real request through the tunnel from a client and shows the exit IP, location and timing.
+- **⚙️ `paqctl config show | set | edit`**: view settings with secrets masked, change them non-interactively (`config set LISTEN_PORT=9443`), or edit `config.yaml` with validation. Changing settings no longer resets your KCP tuning.
+- **🤖 Scriptable everywhere**: `-y` for confirmations, `--json` output, `--no-color`, meaningful exit codes, and a lock so concurrent commands (e.g. `update` and the watchdog) never collide.
+- **🛡️ Reliable IP bans**: IPv4, IPv6 and CIDR ranges; tagged rules that survive restarts and reboots; `ban list` shows only paqctl's bans; warns before you ban your own SSH session.
+- **🔑 Safer key rotation**: backs up first, now actually updates `config.yaml` (the key was previously left unchanged there), restarts, and prints the new client string.
+- **📤 Export / import**: `export --ip` and `--qr`, a warning that the string is a secret, `import '<string>'` or `import -` from stdin, with every field validated.
+- **💾 Backup & restore**: includes GFK certificates and bans, keeps the newest 10, `restore latest` without prompts, and makes a safety backup before restoring.
+- **🧹 Cleanup only touches paqctl's files**: no more system-wide cache drops; vacuuming the shared journal is opt-in (`--journal`).
+- **❓ Help that matches the tool**: every command is in `paqctl help`, `paqctl help <command>` shows options and examples, typos get a "did you mean", and bash completion is installed.
+- **🔁 `enable`/`disable` on OpenRC and SysVinit**, `logs -n/--since/--errors/--backend/--no-follow`, and `self-update` for just the management script.
 
 ---
 
@@ -1087,40 +1103,78 @@ You should see:
 
 ## Server Management
 
-After installing on your VPS, use these commands:
+After installing on your VPS, use these commands. Run `paqctl help` for the full list and `paqctl help <command>` for options and examples. Tab completion for bash is installed automatically.
 
 ```bash
-# Show interactive menu
+# Interactive menu
 sudo paqctl menu
 
-# Quick commands
-sudo paqctl status      # Check if running
-sudo paqctl start       # Start the service
-sudo paqctl stop        # Stop the service
-sudo paqctl restart     # Restart the service
-sudo paqctl info        # Show connection info for clients
-sudo paqctl logs        # View recent logs
+# Service
+sudo paqctl status            # Is it running? (add --json for scripts)
+sudo paqctl start | stop | restart
+sudo paqctl start-all         # Start every installed backend (stop-all to stop)
+sudo paqctl enable            # Auto-start on boot (systemd, OpenRC or SysVinit); disable to turn off
+sudo paqctl watchdog enable   # Self-healing watchdog (disable | status)
+sudo paqctl info              # Connection info + shareable client string
 
-# Diagnostics & Monitoring
-sudo paqctl monitor     # Active Client Monitor (live connection count & unique IPs)
-sudo paqctl speedtest   # Speed & Bandwidth test (Ookla / speedtest-cli / Cloudflare)
-sudo paqctl routing     # DNS Leak & Proxy Routing check
+# Diagnostics
+sudo paqctl health            # Health checks (exit code 1 if anything fails)
+sudo paqctl doctor            # Health checks plus a suggested fix for each problem
+sudo paqctl doctor --fix      # ...and apply the safe fixes (firewall rules, config, start, boot)
+sudo paqctl test              # On a client: real request through the tunnel, shows the exit IP
+sudo paqctl logs              # Follow logs; -n 200 --no-follow --errors --since "1 hour ago" --backend gfk
+sudo paqctl monitor           # Active client monitor (live connections & unique IPs)
+sudo paqctl speedtest         # Speed & bandwidth test
+sudo paqctl routing           # DNS leak & proxy routing check
 
-# Security & Access Control
-sudo paqctl ban <ip>    # Ban an IP address (DROP traffic via firewalld/iptables)
-sudo paqctl unban <ip>  # Unban an IP address
-sudo paqctl rotate-key  # One-Click Encryption Key / Auth Code Rotation
+# Configuration
+sudo paqctl config            # Interactive wizard
+sudo paqctl config show       # Current settings (secrets masked; --reveal to show)
+sudo paqctl config set LISTEN_PORT=9443 KCP_MTU=1200   # Change settings, regenerate config, restart
+sudo paqctl config edit       # Edit config.yaml in $EDITOR (validated before it is applied)
+sudo paqctl export            # Shareable paqet://... or gfk://... string (--ip ADDR, --qr)
+sudo paqctl import '<string>' # Import a client string (or: paqctl import - < file)
+sudo paqctl rotate-key        # New key / auth code, restart, print the new client string
+sudo paqctl tune              # KCP performance profiles (Standard, High-Loss, CDN, Gaming)
+sudo paqctl turbo             # Kernel turbo mode (BBR, larger buffers); turbo-off to undo
 
-# Performance & Tuning (v1.1.0)
-sudo paqctl turbo       # Toggle OS-Level Kernel Turbo Mode (BBR, Buffer Scaling)
-sudo paqctl watchdog    # Toggle Self-Healing Watchdog & Auto-Recovery (Zero Downtime)
-sudo paqctl tune        # Performance & KCP Profile Tuning Menu (Standard, High-Loss, CDN, Gaming)
+# Security
+sudo paqctl ban 203.0.113.7   # Block an IP or range (IPv4/IPv6/CIDR); survives restarts and reboots
+sudo paqctl unban 203.0.113.7
+sudo paqctl ban list
+sudo paqctl firewall          # Show / re-apply paqctl's firewall rules
 
-# Maintenance & QoL
-sudo paqctl cleanup     # System Cleanup (clean logs, temp files, drop OS caches)
-sudo paqctl export      # Export shareable config string (paqet://... or gfk://...)
-sudo paqctl import      # Import config string and start service
+# Maintenance
+sudo paqctl backup            # Back up config, settings, bans and GFK certificates (keeps the newest 10)
+sudo paqctl restore latest    # Restore (or a file name / number); current config is backed up first
+sudo paqctl update            # Update the backend and the management script
+sudo paqctl self-update       # Update only the management script
+sudo paqctl cleanup           # Remove paqctl's old logs, temp files and backups (--journal to vacuum the journal)
+sudo paqctl uninstall
 ```
+
+### Scripting & automation
+
+Every command can run without a terminal:
+
+- `-y` / `--yes` answers confirmation prompts (`rotate-key`, `restore`, `uninstall`, `update`, …).
+- `--json` gives machine-readable output for `status`, `info`, `health`, `doctor`, `export`, `config show` and `ban list`.
+- `--no-color` (or `NO_COLOR=1`) turns colours off; they are also off automatically when output is piped.
+- Exit codes are meaningful: `0` success, `1` failure, `2` invalid usage. `health` and `doctor` exit `1` while any check fails.
+- Commands that change state take a lock, so a running `update` and the watchdog never collide.
+
+```bash
+# Alert if the service is down
+sudo paqctl status --json | jq -e .running >/dev/null || echo "paqctl is down"
+
+# Rotate the key unattended and capture the new client string
+sudo paqctl -y rotate-key && sudo paqctl export --json | jq -r .uri
+
+# Configure a client from a string kept in a file
+sudo paqctl import - < client-string.txt
+```
+
+> **Tip:** if something is not working, start with `sudo paqctl doctor`. It checks for drift (changed interface, IP or gateway MAC), MTU problems, port conflicts and missing firewall rules, and tells you the exact command to fix each one.
 
 ---
 
@@ -1176,7 +1230,7 @@ This tool is for legitimate privacy and access needs. Laws vary by country. Use 
 <details>
 <summary><strong>The server keeps disconnecting</strong></summary>
 
-1. Check server logs: `sudo paqctl logs`
+1. Run `sudo paqctl doctor` and check the server logs: `sudo paqctl logs --errors --no-follow`
 2. Make sure your VPS has enough resources
 3. Check if the port is blocked by your ISP
 4. Try switching between Paqet and GFK
@@ -1414,6 +1468,22 @@ paqctl به صورت خودکار SOCKS5 را روی پورت آزاد بعدی 
 > **توجه:** پیام وضعیت "Firewall: VIO port blocked" (که با رنگ سبز نمایش داده می‌شود) **عادی و صحیح** است. این به معنای آن است که فایروال به درستی برای کار raw socket در GFK تنظیم شده است.
 
 </details>
+
+---
+
+## 🧰 امکانات جدید نسخه v1.2.0: خط فرمان بهتر
+
+- **🩺 دستور `paqctl doctor`**: بررسی سلامت به همراه راه‌حل دقیق برای هر مشکل (تغییر اینترفیس، آی‌پی یا MAC گیت‌وی، MTU، تداخل پورت، قوانین فایروال گم‌شده و ناهماهنگی کانفیگ). با `doctor --fix` راه‌حل‌های امن به صورت خودکار اعمال می‌شوند.
+- **🧪 دستور `paqctl test`**: ارسال یک درخواست واقعی از داخل تانل روی کلاینت و نمایش آی‌پی خروجی، موقعیت و زمان پاسخ.
+- **⚙️ دستورات `paqctl config show | set | edit`**: نمایش تنظیمات با کلیدهای مخفی‌شده، تغییر بدون منو (`config set LISTEN_PORT=9443`) یا ویرایش `config.yaml` همراه با بررسی صحت. تغییر تنظیمات دیگر تنظیمات بهینه‌سازی KCP را پاک نمی‌کند.
+- **🤖 مناسب اسکریپت‌نویسی**: گزینه `-y` برای تاییدها، خروجی `--json`، گزینه `--no-color`، کدهای خروج معنادار و قفل برای جلوگیری از تداخل دستورات همزمان (مثلاً `update` و واچ‌داگ).
+- **🛡️ مسدودسازی مطمئن آی‌پی**: پشتیبانی از IPv4، IPv6 و رنج CIDR؛ قوانین برچسب‌دار که بعد از ریستارت و ریبوت باقی می‌مانند؛ `ban list` فقط آی‌پی‌های مسدودشده توسط paqctl را نشان می‌دهد؛ هشدار پیش از مسدود کردن آی‌پی نشست SSH خودتان.
+- **🔑 تغییر امن‌تر کلید**: ابتدا پشتیبان می‌گیرد، اکنون `config.yaml` را واقعاً به‌روز می‌کند (قبلاً کلید در آن تغییر نمی‌کرد)، سرویس را ریستارت می‌کند و رشته جدید کلاینت را نمایش می‌دهد.
+- **📤 خروجی و ورودی کانفیگ**: گزینه‌های `export --ip` و `--qr`، هشدار محرمانه بودن رشته، `import '<رشته>'` یا `import -` از ورودی استاندارد، با بررسی صحت همه فیلدها.
+- **💾 پشتیبان‌گیری و بازگردانی**: شامل گواهی‌های GFK و آی‌پی‌های مسدود، نگهداری ۱۰ نسخه آخر، `restore latest` بدون سوال و گرفتن پشتیبان ایمنی قبل از بازگردانی.
+- **🧹 پاکسازی فقط فایل‌های paqctl**: دیگر کش کل سیستم پاک نمی‌شود؛ پاکسازی ژورنال مشترک سیستم اختیاری است (`--journal`).
+- **❓ راهنمای کامل**: همه دستورات در `paqctl help`، جزئیات و مثال‌ها با `paqctl help <دستور>`، پیشنهاد دستور درست هنگام اشتباه تایپی و نصب تکمیل خودکار bash.
+- **🔁 دستورات `enable`/`disable` روی OpenRC و SysVinit**، گزینه‌های `logs` (`-n`، `--since`، `--errors`، `--backend`، `--no-follow`) و `self-update` برای به‌روزرسانی فقط اسکریپت مدیریت.
 
 ---
 
@@ -2162,38 +2232,75 @@ paqet.exe run -c config.yaml
 
 ## مدیریت سرور
 
-بعد از نصب روی VPS:
+بعد از نصب روی VPS از دستورات زیر استفاده کنید. فهرست کامل با `paqctl help` و جزئیات هر دستور با `paqctl help <دستور>` نمایش داده می‌شود. تکمیل خودکار (Tab) برای bash به صورت خودکار نصب می‌شود.
 
 ```bash
-# منوی اصلی و سریع
-sudo paqctl menu      # منوی تعاملی
-sudo paqctl status    # بررسی وضعیت
-sudo paqctl start     # شروع سرویس
-sudo paqctl stop      # توقف سرویس
-sudo paqctl restart   # ریستارت
-sudo paqctl info      # اطلاعات اتصال
-sudo paqctl logs      # مشاهده لاگ‌ها
+# منوی تعاملی
+sudo paqctl menu
 
-# عیب‌یابی و مانیتورینگ
-sudo paqctl monitor     # مانیتورینگ کاربران فعال و آی‌پی‌های متصل
-sudo paqctl speedtest   # تست سرعت و پهنای باند سرور
-sudo paqctl routing     # بررسی نشت DNS و وضعیت روتینگ
+# سرویس
+sudo paqctl status            # بررسی وضعیت (برای اسکریپت: --json)
+sudo paqctl start | stop | restart
+sudo paqctl start-all         # اجرای همه بک‌اندهای نصب‌شده (توقف: stop-all)
+sudo paqctl enable            # اجرای خودکار هنگام بوت (systemd، OpenRC یا SysVinit)؛ غیرفعال: disable
+sudo paqctl watchdog enable   # واچ‌داگ خودکار (disable | status)
+sudo paqctl info              # اطلاعات اتصال و رشته اشتراک‌گذاری کلاینت
 
-# امنیت و کنترل دسترسی
-sudo paqctl ban <ip>    # مسدودسازی آی‌پی مزاحم در فایروال
-sudo paqctl unban <ip>  # رفع مسدودی آی‌پی
-sudo paqctl rotate-key  # تغییر سریع و خودکار کلید رمزنگاری / کد احراز هویت
+# عیب‌یابی
+sudo paqctl health            # بررسی سلامت (در صورت خطا کد خروج ۱)
+sudo paqctl doctor            # بررسی سلامت به همراه راه‌حل پیشنهادی برای هر مشکل
+sudo paqctl doctor --fix      # ...و اعمال خودکار راه‌حل‌های امن (فایروال، کانفیگ، اجرا، بوت)
+sudo paqctl test              # روی کلاینت: ارسال درخواست واقعی از داخل تانل و نمایش آی‌پی خروجی
+sudo paqctl logs              # لاگ‌ها؛ گزینه‌ها: -n 200 --no-follow --errors --since "1 hour ago" --backend gfk
+sudo paqctl monitor           # مانیتورینگ کاربران فعال و آی‌پی‌های متصل
+sudo paqctl speedtest         # تست سرعت و پهنای باند سرور
+sudo paqctl routing           # بررسی نشت DNS و وضعیت روتینگ
 
-# بهینه‌سازی و توربو (نسخه v1.1.0)
-sudo paqctl turbo       # فعال‌سازی حالت توربو هسته سیستم‌عامل (BBR و بافر پرسرعت)
-sudo paqctl watchdog    # واچ‌داگ خودکار جهت پایش سلامت و ریکاوری بدون قطعی
-sudo paqctl tune        # منوی تنظیمات پروفایل‌های بهینه‌سازی KCP (استاندارد، ضد-پکت‌لاس، ترافیک CDN، گیمینگ)
+# پیکربندی
+sudo paqctl config            # ویزارد تعاملی
+sudo paqctl config show       # نمایش تنظیمات (کلیدها مخفی؛ برای نمایش: --reveal)
+sudo paqctl config set LISTEN_PORT=9443 KCP_MTU=1200   # تغییر تنظیمات، ساخت مجدد کانفیگ و ریستارت
+sudo paqctl config edit       # ویرایش config.yaml با ویرایشگر (قبل از اعمال بررسی می‌شود)
+sudo paqctl export            # رشته اشتراک‌گذاری paqet://... یا gfk://... (گزینه‌ها: --ip و --qr)
+sudo paqctl import '<رشته>'   # وارد کردن رشته کانفیگ (یا: paqctl import - < file)
+sudo paqctl rotate-key        # کلید / کد احراز هویت جدید، ریستارت و نمایش رشته جدید کلاینت
+sudo paqctl tune              # پروفایل‌های بهینه‌سازی KCP (استاندارد، ضد-پکت‌لاس، CDN، گیمینگ)
+sudo paqctl turbo             # حالت توربو هسته (BBR و بافر بزرگ‌تر)؛ برای لغو: turbo-off
 
-# نگهداری و ابزارهای کاربردی
-sudo paqctl cleanup     # پاکسازی کش سیستم، لاگ‌های قدیمی و فایل‌های موقت
-sudo paqctl export      # دریافت رشته متنی کانفیگ برای اشتراک‌گذاری سریع
-sudo paqctl import      # وارد کردن رشته متنی کانفیگ و راه‌اندازی سریع
+# امنیت
+sudo paqctl ban 203.0.113.7   # مسدودسازی آی‌پی یا رنج (IPv4/IPv6/CIDR)؛ بعد از ریستارت و ریبوت باقی می‌ماند
+sudo paqctl unban 203.0.113.7
+sudo paqctl ban list
+sudo paqctl firewall          # نمایش / اعمال مجدد قوانین فایروال paqctl
+
+# نگهداری
+sudo paqctl backup            # پشتیبان از کانفیگ، تنظیمات، آی‌پی‌های مسدود و گواهی‌های GFK (۱۰ نسخه آخر نگه داشته می‌شود)
+sudo paqctl restore latest    # بازگردانی (یا نام فایل / شماره)؛ قبل از آن از کانفیگ فعلی پشتیبان گرفته می‌شود
+sudo paqctl update            # به‌روزرسانی بک‌اند و اسکریپت مدیریت
+sudo paqctl self-update       # فقط به‌روزرسانی اسکریپت مدیریت
+sudo paqctl cleanup           # حذف لاگ‌های قدیمی، فایل‌های موقت و پشتیبان‌های قدیمی paqctl (--journal برای پاکسازی ژورنال)
+sudo paqctl uninstall
 ```
+
+### اسکریپت‌نویسی و خودکارسازی
+
+همه دستورات بدون ترمینال هم اجرا می‌شوند:
+
+- گزینه `-y` / `--yes` به سوال‌های تایید پاسخ مثبت می‌دهد (`rotate-key`، `restore`، `uninstall`، `update` و …).
+- گزینه `--json` خروجی قابل پردازش برای `status`، `info`، `health`، `doctor`، `export`، `config show` و `ban list` می‌دهد.
+- گزینه `--no-color` (یا `NO_COLOR=1`) رنگ‌ها را خاموش می‌کند؛ هنگام pipe کردن خروجی هم خودکار خاموش می‌شوند.
+- کدهای خروج معنادار هستند: `0` موفق، `1` خطا، `2` استفاده نادرست. `health` و `doctor` تا وقتی مشکلی وجود دارد کد `1` برمی‌گردانند.
+- دستوراتی که وضعیت را تغییر می‌دهند قفل می‌گیرند تا مثلاً `update` و واچ‌داگ با هم تداخل نداشته باشند.
+
+```bash
+# هشدار در صورت خاموش بودن سرویس
+sudo paqctl status --json | jq -e .running >/dev/null || echo "paqctl is down"
+
+# تغییر خودکار کلید و دریافت رشته جدید کلاینت
+sudo paqctl -y rotate-key && sudo paqctl export --json | jq -r .uri
+```
+
+> **نکته:** اگر چیزی کار نمی‌کند، ابتدا `sudo paqctl doctor` را اجرا کنید. تغییر اینترفیس، آی‌پی یا MAC گیت‌وی، مشکلات MTU، تداخل پورت و قوانین فایروال گم‌شده را بررسی می‌کند و دستور دقیق رفع هر مشکل را نشان می‌دهد.
 
 ---
 
@@ -2243,7 +2350,7 @@ sudo paqctl import      # وارد کردن رشته متنی کانفیگ و ر
 <details>
 <summary><strong>سرور مدام قطع می‌شود</strong></summary>
 
-1. لاگ‌ها را بررسی کنید: `sudo paqctl logs`
+1. دستور `sudo paqctl doctor` را اجرا کنید و لاگ‌ها را بررسی کنید: `sudo paqctl logs --errors --no-follow`
 2. منابع VPS را بررسی کنید
 3. پورت توسط ISP مسدود نشده باشد
 4. بین Paqet و GFK سوییچ کنید

@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ╔═══════════════════════════════════════════════════════════════════╗
-# ║      PAQCTL - Paqet Manager v1.1.0                                ║
+# ║      PAQCTL - Paqet Manager v1.2.0                                ║
 # ║                                                                   ║
 # ║  One-click setup for Paqet raw-socket proxy                       ║
 # ║                                                                   ║
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     exit 1
 fi
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # Pinned versions for stability (update these after testing new releases)
 PAQET_VERSION_PINNED="v1.0.0-alpha.21-a1"
@@ -2378,7 +2378,7 @@ create_management_script() {
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # Pinned versions for stability (update these after testing new releases)
 PAQET_VERSION_PINNED="v1.0.0-alpha.21-a1"
@@ -2405,6 +2405,35 @@ MAGENTA='\033[0;35m'
 BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
+
+# Global flags (accepted anywhere on the command line, before an optional "--")
+#   -y, --yes    answer yes to confirmation prompts
+#   --json       machine-readable output where supported
+#   --no-color   disable colours (also honours NO_COLOR and non-terminal output)
+ASSUME_YES=false
+JSON_OUTPUT=false
+MENU_MODE=false
+_paqctl_args=()
+_paqctl_flags_done=false
+for _paqctl_a in "$@"; do
+    if [ "$_paqctl_flags_done" = true ]; then
+        _paqctl_args+=("$_paqctl_a")
+        continue
+    fi
+    case "$_paqctl_a" in
+        -y|--yes)   ASSUME_YES=true ;;
+        --json)     JSON_OUTPUT=true ;;
+        --no-color|--no-colour) NO_COLOR=1 ;;
+        --)         _paqctl_flags_done=true ;;
+        *)          _paqctl_args+=("$_paqctl_a") ;;
+    esac
+done
+set -- "${_paqctl_args[@]}"
+unset _paqctl_a _paqctl_flags_done
+
+if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ] || [ "$JSON_OUTPUT" = true ]; then
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' MAGENTA='' BOLD='' DIM='' NC=''
+fi
 
 # Input validation helpers
 _validate_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
@@ -2484,7 +2513,8 @@ detect_network() {
 }
 
 _load_settings() {
-    [ -f "$INSTALL_DIR/settings.conf" ] || return 0
+    # Unreadable (e.g. non-root running 'paqctl help') is not an error
+    [ -r "$INSTALL_DIR/settings.conf" ] || return 0
     # Safe settings loading without eval - uses case statement
     while IFS='=' read -r key value; do
         [[ "$key" =~ ^[A-Z_][A-Z_0-9]*$ ]] || continue
@@ -2578,16 +2608,205 @@ MICROSOCKS_PORT=${MICROSOCKS_PORT:-}
 GFK_SERVER_IP=${GFK_SERVER_IP:-}
 GFK_TCP_FLAGS=${GFK_TCP_FLAGS:-AP}
 
-# Ensure root
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}Error: This command must be run as root (use sudo paqctl)${NC}"
-    exit 1
-fi
+# Root is checked per command in _main (help/version/completion work without it)
+_require_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}Error: This command must be run as root (use sudo paqctl)${NC}" >&2
+        return 1
+    fi
+}
 
-log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
-log_success() { echo -e "${GREEN}[✓]${NC} $1"; }
-log_warn()    { echo -e "${YELLOW}[!]${NC} $1"; }
-log_error()   { echo -e "${RED}[✗]${NC} $1"; }
+# In --json mode, human-readable log lines go to stderr so stdout stays valid JSON
+_log_fd() { if [ "$JSON_OUTPUT" = true ]; then cat >&2; else cat; fi; }
+log_info()    { echo -e "${BLUE}[INFO]${NC} $1" | _log_fd; }
+log_success() { echo -e "${GREEN}[✓]${NC} $1" | _log_fd; }
+log_warn()    { echo -e "${YELLOW}[!]${NC} $1" | _log_fd; }
+log_error()   { echo -e "${RED}[✗]${NC} $1" >&2; }
+
+#═══════════════════════════════════════════════════════════════════════
+# CLI helpers: prompts, JSON, locking, backend detection
+#═══════════════════════════════════════════════════════════════════════
+
+# True when a terminal is available for interactive prompts
+_has_tty() { { : < /dev/tty; } 2>/dev/null; }
+
+# _confirm "Question?"  -> 0 on yes. Honours -y/--yes; fails safely without a terminal.
+_confirm() {
+    [ "$ASSUME_YES" = true ] && return 0
+    if ! _has_tty; then
+        log_error "Confirmation required but no terminal is available. Re-run with -y to confirm."
+        return 1
+    fi
+    local _reply
+    read -r -p "  $1 [y/N]: " _reply < /dev/tty || return 1
+    [[ "$_reply" =~ ^[Yy]$ ]]
+}
+
+_json_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"
+    printf '"%s"' "$s"
+}
+_json_bool() { if [ "$1" = true ]; then printf 'true'; else printf 'false'; fi; }
+_json_num() { if [[ "$1" =~ ^[0-9]+$ ]]; then printf '%s' "$1"; else printf 'null'; fi; }
+
+# Mutual exclusion between paqctl invocations (e.g. watchdog vs. update).
+# Uses an atomic mkdir instead of flock so background daemons started by a
+# locked command never inherit (and keep holding) the lock.
+_PAQCTL_LOCK_DIR="/run/paqctl.lock"
+[ -d /run ] && [ -w /run ] || _PAQCTL_LOCK_DIR="$INSTALL_DIR/.lock"
+_PAQCTL_LOCK_HELD=false
+_acquire_lock() {
+    local mode="${1:-wait}" waited=0 empty_pid=0 _pid
+    [ "$_PAQCTL_LOCK_HELD" = true ] && return 0
+    while ! mkdir "$_PAQCTL_LOCK_DIR" 2>/dev/null; do
+        _pid=$(cat "$_PAQCTL_LOCK_DIR/pid" 2>/dev/null || true)
+        if [ -n "$_pid" ] && ! kill -0 "$_pid" 2>/dev/null; then
+            rm -rf "$_PAQCTL_LOCK_DIR" 2>/dev/null || true
+            continue
+        fi
+        if [ -z "$_pid" ]; then
+            empty_pid=$((empty_pid + 1))
+            # Holder died between mkdir and writing its pid
+            [ "$empty_pid" -ge 5 ] && { rm -rf "$_PAQCTL_LOCK_DIR" 2>/dev/null || true; continue; }
+        fi
+        [ "$mode" = "nowait" ] && return 1
+        [ "$waited" -eq 0 ] && log_info "Another paqctl command is running (pid ${_pid:-?}); waiting for it to finish..."
+        sleep 1
+        waited=$((waited + 1))
+        if [ "$waited" -ge 180 ]; then
+            log_error "Timed out waiting for another paqctl command. If none is running, remove $_PAQCTL_LOCK_DIR"
+            return 1
+        fi
+    done
+    echo "$$" > "$_PAQCTL_LOCK_DIR/pid"
+    _PAQCTL_LOCK_HELD=true
+    trap '_release_lock' EXIT
+}
+_release_lock() {
+    [ "$_PAQCTL_LOCK_HELD" = true ] || return 0
+    [ "$(cat "$_PAQCTL_LOCK_DIR/pid" 2>/dev/null)" = "$$" ] && rm -rf "$_PAQCTL_LOCK_DIR" 2>/dev/null
+    _PAQCTL_LOCK_HELD=false
+}
+
+_paqet_installed() { [ -f "$INSTALL_DIR/bin/paqet" ]; }
+_gfk_installed() {
+    if [ "$ROLE" = "server" ]; then
+        [ -d "$GFK_DIR" ] && [ -f "$GFK_DIR/quic_server.py" ]
+    else
+        [ -d "$GFK_DIR" ] && [ -f "$GFK_DIR/quic_client.py" ]
+    fi
+}
+
+# Local SOCKS5 port a GFK client exposes
+_gfk_client_socks_port() {
+    if [ -n "${GFK_SOCKS_VIO_PORT:-}" ]; then
+        echo "$GFK_SOCKS_VIO_PORT"
+    else
+        echo "${GFK_PORT_MAPPINGS:-14000:443}" | cut -d, -f1 | cut -d: -f1
+    fi
+}
+
+# Write config.yaml atomically from current settings (never leaves a half-written file)
+_write_paqet_config() {
+    local target="${1:-$INSTALL_DIR/config.yaml}" tmp
+    tmp=$(mktemp "${target}.XXXXXXXX") || { log_error "Failed to create temp file"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null
+    if ! (umask 077; generate_paqet_yaml "$tmp"); then
+        rm -f "$tmp"; log_error "Failed to generate config.yaml"; return 1
+    fi
+    if ! mv -f "$tmp" "$target"; then
+        rm -f "$tmp"; log_error "Failed to write $target"; return 1
+    fi
+    chmod 600 "$target" 2>/dev/null
+    return 0
+}
+
+# Persist current firewall state so it survives a reboot
+persist_iptables_rules() {
+    if _is_firewalld_active; then
+        firewall-cmd --runtime-to-permanent 2>/dev/null || true
+        return 0
+    fi
+    if [ -x /etc/init.d/iptables ]; then
+        /etc/init.d/iptables save 2>/dev/null || true
+    fi
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save 2>/dev/null || true
+    elif command -v iptables-save &>/dev/null; then
+        if [ -d /etc/iptables ] || [ -f /etc/debian_version ]; then
+            mkdir -p /etc/iptables
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            command -v ip6tables-save &>/dev/null && { ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true; }
+        elif [ -d /etc/sysconfig ]; then
+            iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+            command -v ip6tables-save &>/dev/null && { ip6tables-save > /etc/sysconfig/ip6tables 2>/dev/null || true; }
+        fi
+    fi
+}
+
+# Used by the watchdog; no-op unless Telegram is configured
+send_telegram_alert() {
+    [ "${TELEGRAM_ENABLED:-false}" = "true" ] || return 0
+    telegram_send_message "$1"
+}
+
+# Which init system manages paqctl: systemd | openrc | sysv (returns 1 if none)
+_init_system() {
+    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
+        echo systemd
+    elif command -v rc-update &>/dev/null && [ -f /etc/init.d/paqctl ]; then
+        echo openrc
+    elif [ -f /etc/init.d/paqctl ]; then
+        echo sysv
+    else
+        return 1
+    fi
+}
+
+_boot_enabled() {
+    case "$(_init_system 2>/dev/null)" in
+        systemd) systemctl is-enabled paqctl.service &>/dev/null ;;
+        openrc)  rc-update show default 2>/dev/null | grep -qw paqctl ;;
+        sysv)    ls /etc/rc[2345].d/S*paqctl &>/dev/null ;;
+        *)       return 1 ;;
+    esac
+}
+
+# _set_boot enable|disable
+_set_boot() {
+    local action="$1" init rc=1
+    init=$(_init_system) || { log_error "No supported init system found (systemd, OpenRC or SysVinit with /etc/init.d/paqctl)"; return 1; }
+    case "$init:$action" in
+        systemd:enable)  systemctl enable paqctl.service &>/dev/null && rc=0 ;;
+        systemd:disable) systemctl disable paqctl.service &>/dev/null && rc=0 ;;
+        openrc:enable)   rc-update add paqctl default &>/dev/null && rc=0 ;;
+        openrc:disable)  rc-update del paqctl default &>/dev/null && rc=0 ;;
+        sysv:enable)
+            if command -v update-rc.d &>/dev/null; then
+                { update-rc.d paqctl defaults && update-rc.d paqctl enable; } &>/dev/null && rc=0
+            elif command -v chkconfig &>/dev/null; then
+                { chkconfig --add paqctl; chkconfig paqctl on; } &>/dev/null && rc=0
+            fi ;;
+        sysv:disable)
+            if command -v update-rc.d &>/dev/null; then
+                update-rc.d paqctl disable &>/dev/null && rc=0
+            elif command -v chkconfig &>/dev/null; then
+                chkconfig paqctl off &>/dev/null && rc=0
+            fi ;;
+        *) log_error "Unknown boot action: $action"; return 2 ;;
+    esac
+    if [ "$rc" -ne 0 ]; then
+        log_error "Failed to ${action} auto-start ($init)"
+        return 1
+    fi
+    if [ "$action" = "enable" ]; then
+        log_success "Auto-start on boot enabled ($init)"
+    else
+        log_success "Auto-start on boot disabled ($init)"
+    fi
+}
 
 # Retry helper with exponential backoff for API requests
 _curl_with_retry() {
@@ -4018,6 +4237,9 @@ _apply_firewall() {
         return 1
     fi
 
+    # IP bans are independent of backend/role; re-apply them on every start
+    _reapply_bans
+
     if [ "$BACKEND" = "gfw-knocker" ]; then
         local vio_port
         if [ "$ROLE" = "server" ]; then
@@ -4258,7 +4480,80 @@ _persist_firewall() {
 # Status & Info
 #═══════════════════════════════════════════════════════════════════════
 
+# Seconds since paqctl.service became active (systemd only)
+_service_uptime_seconds() {
+    command -v systemctl &>/dev/null && [ -d /run/systemd/system ] || return 1
+    local started ts
+    started=$(systemctl show paqctl.service --property=ActiveEnterTimestamp 2>/dev/null | cut -d= -f2)
+    [ -n "$started" ] || return 1
+    ts=$(date -d "$started" +%s 2>/dev/null) || return 1
+    [ "$ts" -gt 0 ] 2>/dev/null || return 1
+    echo $(( $(date +%s) - ts ))
+}
+
+# Are the server-side firewall rules for the active backend in place?
+_firewall_rules_ok() {
+    command -v iptables &>/dev/null || return 1
+    if [ "$BACKEND" = "gfw-knocker" ]; then
+        local _vp="${GFK_VIO_PORT:-45000}"
+        { iptables -C INPUT -p tcp --dport "$_vp" -m comment --comment "paqctl" -j DROP 2>/dev/null || \
+          iptables -C INPUT -p tcp --dport "$_vp" -j DROP 2>/dev/null; } && \
+        { iptables -C OUTPUT -p tcp --sport "$_vp" --tcp-flags RST RST -m comment --comment "paqctl" -j DROP 2>/dev/null || \
+          iptables -C OUTPUT -p tcp --sport "$_vp" --tcp-flags RST RST -j DROP 2>/dev/null; }
+    else
+        iptables -t raw -C PREROUTING -p tcp --dport "${LISTEN_PORT:-8443}" -m comment --comment "paqctl" -j NOTRACK 2>/dev/null && \
+        iptables -t mangle -C OUTPUT -p tcp --sport "${LISTEN_PORT:-8443}" -m comment --comment "paqctl" --tcp-flags RST RST -j DROP 2>/dev/null
+    fi
+}
+
+_status_json() {
+    local running=false p_inst=false g_inst=false p_run=false g_run=false
+    is_running && running=true
+    _paqet_installed && p_inst=true
+    _gfk_installed && g_inst=true
+    is_paqet_running && p_run=true
+    is_gfk_running && g_run=true
+    local pid="" uptime="" fw="null" boot="null"
+    if [ "$BACKEND" = "gfw-knocker" ]; then
+        pid=$(pgrep -f "mainserver.py|mainclient.py" 2>/dev/null | head -1)
+    else
+        pid=$(pgrep -f "paqet run -c" 2>/dev/null | head -1)
+    fi
+    uptime=$(_service_uptime_seconds 2>/dev/null || true)
+    if [ "$ROLE" = "server" ]; then
+        if _firewall_rules_ok; then fw=true; else fw=false; fi
+    fi
+    if _boot_enabled; then boot=true; else boot=false; fi
+    printf '{'
+    printf '"paqctl_version":%s,' "$(_json_str "$VERSION")"
+    printf '"backend":%s,"role":%s,' "$(_json_str "$BACKEND")" "$(_json_str "$ROLE")"
+    printf '"running":%s,"pid":%s,"uptime_seconds":%s,' "$(_json_bool "$running")" "$(_json_num "$pid")" "$(_json_num "$uptime")"
+    printf '"boot_enabled":%s,"firewall_ok":%s,' "$boot" "$fw"
+    printf '"paqet":{"installed":%s,"running":%s,"version":%s},' "$(_json_bool "$p_inst")" "$(_json_bool "$p_run")" "$(_json_str "${PAQET_VERSION:-unknown}")"
+    printf '"gfk":{"installed":%s,"running":%s},' "$(_json_bool "$g_inst")" "$(_json_bool "$g_run")"
+    if [ "$BACKEND" = "gfw-knocker" ]; then
+        printf '"server_ip":%s,"vio_port":%s,"quic_port":%s,"port_mappings":%s,' \
+            "$(_json_str "${GFK_SERVER_IP:-}")" "$(_json_num "${GFK_VIO_PORT:-}")" "$(_json_num "${GFK_QUIC_PORT:-}")" "$(_json_str "${GFK_PORT_MAPPINGS:-}")"
+        [ "$ROLE" = "client" ] && printf '"socks_port":%s,' "$(_json_num "$(_gfk_client_socks_port)")"
+    else
+        printf '"interface":%s,"local_ip":%s,' "$(_json_str "${INTERFACE:-}")" "$(_json_str "${LOCAL_IP:-}")"
+        if [ "$ROLE" = "server" ]; then
+            printf '"listen_port":%s,' "$(_json_num "${LISTEN_PORT:-}")"
+        else
+            printf '"remote_server":%s,"socks_port":%s,"routing_mode":%s,' "$(_json_str "${REMOTE_SERVER:-}")" "$(_json_num "${SOCKS_PORT:-}")" "$(_json_str "${ROUTING_MODE:-socks5}")"
+        fi
+        printf '"kcp_profile":%s,"kcp_mtu":%s,' "$(_json_str "${KCP_PROFILE:-standard}")" "$(_json_num "${KCP_MTU:-1350}")"
+    fi
+    printf '"watchdog_enabled":%s,"turbo_enabled":%s,"telegram_enabled":%s' \
+        "$(_json_bool "${WATCHDOG_ENABLED:-false}")" "$(_json_bool "${TURBO_ENABLED:-false}")" "$(_json_bool "${TELEGRAM_ENABLED:-false}")"
+    printf '}\n'
+}
+
 show_status() {
+    if [ "$JSON_OUTPUT" = true ]; then
+        _status_json
+        return 0
+    fi
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}  PAQCTL STATUS (${BACKEND})${NC}"
@@ -4409,220 +4704,497 @@ show_status() {
 #═══════════════════════════════════════════════════════════════════════
 
 show_logs() {
-    echo ""
-    log_info "Showing paqet logs (Ctrl+C to return to menu)..."
-    echo ""
-
-    # Trap Ctrl+C to return to menu instead of exiting
-    trap 'echo ""; log_info "Returning to menu..."; return 0' INT
-
-    if command -v journalctl &>/dev/null && [ -d /run/systemd/system ]; then
-        journalctl -u paqctl.service -f --no-pager -n 50
-    elif [ -f /var/log/paqctl.log ]; then
-        tail -f -n 50 /var/log/paqctl.log
-    else
-        log_warn "No logs found. Is paqet running?"
+    local lines=50 follow="" since="" backend="" errors=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n|--lines)
+                [[ "${2:-}" =~ ^[0-9]+$ ]] || { log_error "$1 needs a number"; return 2; }
+                lines="$2"; shift 2 ;;
+            -n[0-9]*) lines="${1#-n}"; shift ;;
+            --lines=*) lines="${1#--lines=}"; shift ;;
+            -f|--follow) follow=true; shift ;;
+            --no-follow) follow=false; shift ;;
+            --since)
+                [ -n "${2:-}" ] || { log_error "--since needs a value (e.g. '1 hour ago', 2024-01-01)"; return 2; }
+                since="$2"; shift 2 ;;
+            --since=*) since="${1#--since=}"; shift ;;
+            --backend)
+                [ -n "${2:-}" ] || { log_error "--backend needs 'paqet' or 'gfk'"; return 2; }
+                backend="$2"; shift 2 ;;
+            --backend=*) backend="${1#--backend=}"; shift ;;
+            --errors) errors=true; shift ;;
+            *) log_error "Unknown option for logs: $1"; echo "  Usage: paqctl logs [-n N] [--no-follow] [--since TIME] [--backend paqet|gfk] [--errors]" >&2; return 2 ;;
+        esac
+    done
+    [[ "$lines" =~ ^[0-9]+$ ]] || { log_error "Invalid line count: $lines"; return 2; }
+    case "$backend" in
+        ""|paqet|gfk) ;;
+        gfw-knocker) backend="gfk" ;;
+        *) log_error "--backend must be 'paqet' or 'gfk'"; return 2 ;;
+    esac
+    # Follow by default only when someone is watching
+    if [ -z "$follow" ]; then
+        if [ -t 1 ]; then follow=true; else follow=false; fi
     fi
 
-    # Restore default trap
-    trap - INT
+    # Pick a log source: a backend's own log file when asked (and present),
+    # otherwise the service journal / log file.
+    local src_file="" use_journal=false
+    if [ "$backend" = "gfk" ] && [ -f /var/log/gfk-backend.log ]; then
+        src_file=/var/log/gfk-backend.log
+    elif [ "$backend" = "paqet" ] && [ -f /var/log/paqet-backend.log ]; then
+        src_file=/var/log/paqet-backend.log
+    elif command -v journalctl &>/dev/null && [ -d /run/systemd/system ]; then
+        use_journal=true
+    elif [ -f /var/log/paqctl.log ]; then
+        src_file=/var/log/paqctl.log
+    elif [ -f /var/log/paqet-backend.log ]; then
+        src_file=/var/log/paqet-backend.log
+    elif [ -f /var/log/gfk-backend.log ]; then
+        src_file=/var/log/gfk-backend.log
+    else
+        log_warn "No logs found. Is paqctl running?"
+        return 1
+    fi
+    if [ -n "$since" ] && [ "$use_journal" != true ]; then
+        log_warn "--since is only supported with the systemd journal; showing the last $lines lines of $src_file"
+    fi
+
+    local -a cmd
+    if [ "$use_journal" = true ]; then
+        cmd=(journalctl -u paqctl.service --no-pager -n "$lines")
+        [ -n "$since" ] && cmd+=(--since "$since")
+        [ "$follow" = true ] && cmd+=(-f)
+    else
+        cmd=(tail -n "$lines")
+        [ "$follow" = true ] && cmd+=(-f)
+        cmd+=("$src_file")
+    fi
+
+    if [ "$follow" = true ]; then
+        echo ""
+        log_info "Showing logs$([ -n "$src_file" ] && echo " from $src_file") (Ctrl+C to stop)..."
+        echo ""
+        # Trap Ctrl+C to return to menu instead of exiting
+        trap 'echo ""; log_info "Stopped following logs."; return 0' INT
+    fi
+
+    if [ "$errors" = true ]; then
+        "${cmd[@]}" 2>&1 | grep --line-buffered -iE 'error|fail|fatal|panic|warn|refused|timeout' || true
+    else
+        "${cmd[@]}"
+    fi
+    local rc=$?
+
+    [ "$follow" = true ] && trap - INT
+    return $rc
 }
 
 #═══════════════════════════════════════════════════════════════════════
 # Health Check
 #═══════════════════════════════════════════════════════════════════════
 
-health_check() {
+_print_section() {
+    [ "$JSON_OUTPUT" = true ] && return 0
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}  HEALTH CHECK${NC}"
+    echo -e "${BOLD}  $1${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
+}
 
-    local issues=0
+# Check results: "status<US>message<US>hint<US>fix-id" (US = \x1f)
+_HC_RESULTS=()
+_HC_FAILS=0
+_HC_WARNS=0
+_HC_SHOW_HINTS=false
+_HC_QUIET=false
+
+# _hc ok|fail|warn|info "message" ["hint"] ["fix-id"]
+_hc() {
+    local st="$1" msg="$2" hint="${3:-}" fix="${4:-}"
+    _HC_RESULTS+=("${st}"$'\x1f'"${msg}"$'\x1f'"${hint}"$'\x1f'"${fix}")
+    case "$st" in
+        fail) _HC_FAILS=$((_HC_FAILS + 1)) ;;
+        warn) _HC_WARNS=$((_HC_WARNS + 1)) ;;
+    esac
+    if [ "$JSON_OUTPUT" = true ] || [ "$_HC_QUIET" = true ]; then
+        return 0
+    fi
+    _hc_print_line "$st" "$msg" "$hint"
+}
+
+_hc_print_line() {
+    local st="$1" msg="$2" hint="${3:-}"
+    case "$st" in
+        ok)   echo -e "  ${GREEN}✓${NC} ${msg}" ;;
+        fail) echo -e "  ${RED}✗${NC} ${msg}" ;;
+        warn) echo -e "  ${YELLOW}!${NC} ${msg}" ;;
+        *)    echo -e "  ${DIM}• ${msg}${NC}" ;;
+    esac
+    if [ "$_HC_SHOW_HINTS" = true ] && [ -n "$hint" ] && [ "$st" != "ok" ]; then
+        echo -e "      ${CYAN}→${NC} ${hint}"
+    fi
+}
+
+_hc_iptables_has() { command -v iptables &>/dev/null && iptables "$@" 2>/dev/null; }
+
+_run_health_checks() {
+    local doctor="${1:-false}"
+    _HC_RESULTS=(); _HC_FAILS=0; _HC_WARNS=0
 
     if [ "$BACKEND" = "gfw-knocker" ]; then
-        # 1. Python scripts exist
         if [ -f "$GFK_DIR/mainserver.py" ] && [ -f "$GFK_DIR/mainclient.py" ]; then
-            echo -e "  ${GREEN}✓${NC} GFW-knocker scripts found"
+            _hc ok "GFW-knocker scripts found"
         else
-            echo -e "  ${RED}✗${NC} GFW-knocker scripts missing from $GFK_DIR"
-            issues=$((issues + 1))
+            _hc fail "GFW-knocker scripts missing from $GFK_DIR" "Reinstall GFK: sudo paqctl update"
         fi
 
-        # 2. Python + deps (check venv)
         if [ -x "$INSTALL_DIR/venv/bin/python" ] && "$INSTALL_DIR/venv/bin/python" -c "import scapy; import aioquic" 2>/dev/null; then
-            echo -e "  ${GREEN}✓${NC} Python dependencies OK (scapy, aioquic)"
+            _hc ok "Python dependencies OK (scapy, aioquic)"
         else
-            echo -e "  ${RED}✗${NC} Python dependencies missing (venv not setup)"
-            issues=$((issues + 1))
+            _hc fail "Python dependencies missing (venv not set up)" "Reinstall them: $INSTALL_DIR/venv/bin/pip install scapy aioquic (or re-run the installer)"
         fi
 
-        # 3. Config
         if [ -f "$GFK_DIR/parameters.py" ]; then
-            echo -e "  ${GREEN}✓${NC} GFK configuration found"
+            _hc ok "GFK configuration found"
         else
-            echo -e "  ${RED}✗${NC} GFK configuration missing"
-            issues=$((issues + 1))
+            _hc fail "GFK configuration missing" "Regenerate it: sudo paqctl config"
         fi
 
-        # 4. Certificates
         if [ -f "$GFK_DIR/cert.pem" ] && [ -f "$GFK_DIR/key.pem" ]; then
-            echo -e "  ${GREEN}✓${NC} QUIC certificates found"
+            _hc ok "QUIC certificates found"
         else
-            echo -e "  ${RED}✗${NC} QUIC certificates missing"
-            issues=$((issues + 1))
+            _hc fail "QUIC certificates missing" "Restore them (sudo paqctl restore latest) or re-run the installer"
         fi
 
-        # 5. Service running
         if is_running; then
-            echo -e "  ${GREEN}✓${NC} GFW-knocker is running"
+            _hc ok "GFW-knocker is running"
         else
-            echo -e "  ${RED}✗${NC} GFW-knocker is not running"
-            issues=$((issues + 1))
+            _hc fail "GFW-knocker is not running" "Start it: sudo paqctl start (logs: sudo paqctl logs --backend gfk --errors --no-follow)" start
         fi
 
-        # 6. Firewall (server)
         if [ "$ROLE" = "server" ]; then
-            # Check both tagged and untagged rules (tagged added by _apply_firewall, untagged by install wizard)
+            # Tagged rules come from _apply_firewall, untagged ones from older installs
             local _vio_port="${GFK_VIO_PORT:-45000}"
-            if iptables -C INPUT -p tcp --dport "$_vio_port" -m comment --comment "paqctl" -j DROP 2>/dev/null || \
-               iptables -C INPUT -p tcp --dport "$_vio_port" -j DROP 2>/dev/null; then
-                echo -e "  ${GREEN}✓${NC} VIO port ${_vio_port} INPUT blocked"
+            if _hc_iptables_has -C INPUT -p tcp --dport "$_vio_port" -m comment --comment "paqctl" -j DROP || \
+               _hc_iptables_has -C INPUT -p tcp --dport "$_vio_port" -j DROP; then
+                _hc ok "VIO port ${_vio_port} INPUT blocked"
             else
-                echo -e "  ${RED}✗${NC} VIO port ${_vio_port} INPUT NOT blocked"
-                issues=$((issues + 1))
+                _hc fail "VIO port ${_vio_port} INPUT NOT blocked" "Apply firewall rules: sudo paqctl firewall (option 1)" firewall
             fi
-            # Check RST DROP rule (prevents kernel from sending RST packets)
-            if iptables -C OUTPUT -p tcp --sport "$_vio_port" --tcp-flags RST RST -m comment --comment "paqctl" -j DROP 2>/dev/null || \
-               iptables -C OUTPUT -p tcp --sport "$_vio_port" --tcp-flags RST RST -j DROP 2>/dev/null; then
-                echo -e "  ${GREEN}✓${NC} VIO port ${_vio_port} RST DROP in place"
+            if _hc_iptables_has -C OUTPUT -p tcp --sport "$_vio_port" --tcp-flags RST RST -m comment --comment "paqctl" -j DROP || \
+               _hc_iptables_has -C OUTPUT -p tcp --sport "$_vio_port" --tcp-flags RST RST -j DROP; then
+                _hc ok "VIO port ${_vio_port} RST DROP in place"
             else
-                echo -e "  ${RED}✗${NC} VIO port ${_vio_port} RST DROP missing"
-                issues=$((issues + 1))
-            fi
-        fi
-
-        # 7. SOCKS5 port (client)
-        if [ "$ROLE" = "client" ]; then
-            local _socks_vio
-            if [ -n "${GFK_SOCKS_VIO_PORT:-}" ]; then
-                _socks_vio="$GFK_SOCKS_VIO_PORT"
-            else
-                _socks_vio=$(echo "${GFK_PORT_MAPPINGS:-14000:443}" | cut -d, -f1 | cut -d: -f1)
-            fi
-            if is_running && ss -tlnp 2>/dev/null | grep -q ":${_socks_vio} "; then
-                echo -e "  ${GREEN}✓${NC} SOCKS5 port ${_socks_vio} is listening"
-            elif is_running; then
-                echo -e "  ${RED}✗${NC} SOCKS5 port ${_socks_vio} not listening"
-                issues=$((issues + 1))
-            fi
-        fi
-    else
-        # 1. Binary exists
-        if [ -x "$INSTALL_DIR/bin/paqet" ]; then
-            echo -e "  ${GREEN}✓${NC} paqet binary found"
-        else
-            echo -e "  ${RED}✗${NC} paqet binary not found at $INSTALL_DIR/bin/paqet"
-            issues=$((issues + 1))
-        fi
-
-        # 2. Config exists
-        if [ -f "$INSTALL_DIR/config.yaml" ]; then
-            echo -e "  ${GREEN}✓${NC} Configuration file found"
-        else
-            echo -e "  ${RED}✗${NC} Configuration file missing"
-            issues=$((issues + 1))
-        fi
-
-        # 3. Service running
-        if is_running; then
-            echo -e "  ${GREEN}✓${NC} paqet is running"
-        else
-            echo -e "  ${RED}✗${NC} paqet is not running"
-            issues=$((issues + 1))
-        fi
-
-        # 4. libpcap
-        if ldconfig -p 2>/dev/null | grep -q libpcap; then
-            echo -e "  ${GREEN}✓${NC} libpcap is available"
-        else
-            echo -e "  ${YELLOW}!${NC} libpcap not found in ldconfig (may still work)"
-        fi
-
-        # 5. iptables (server only)
-        if [ "$ROLE" = "server" ]; then
-            if iptables -t raw -C PREROUTING -p tcp --dport "$LISTEN_PORT" -m comment --comment "paqctl" -j NOTRACK 2>/dev/null; then
-                echo -e "  ${GREEN}✓${NC} iptables NOTRACK rules in place (port $LISTEN_PORT)"
-            else
-                echo -e "  ${RED}✗${NC} iptables NOTRACK rules missing for port $LISTEN_PORT"
-                issues=$((issues + 1))
-            fi
-
-            if iptables -t mangle -C OUTPUT -p tcp --sport "$LISTEN_PORT" -m comment --comment "paqctl" --tcp-flags RST RST -j DROP 2>/dev/null; then
-                echo -e "  ${GREEN}✓${NC} iptables RST DROP rule in place"
-            else
-                echo -e "  ${RED}✗${NC} iptables RST DROP rule missing"
-                issues=$((issues + 1))
-            fi
-        fi
-
-        # 6. Port listening (server) or connectivity (client)
-        if [ "$ROLE" = "server" ] && is_running; then
-            if ss -tlnp 2>/dev/null | grep -q ":${LISTEN_PORT}"; then
-                echo -e "  ${GREEN}✓${NC} Port $LISTEN_PORT is listening"
-            else
-                echo -e "  ${YELLOW}!${NC} Port $LISTEN_PORT not shown in ss (paqet uses raw sockets)"
+                _hc fail "VIO port ${_vio_port} RST DROP missing" "Apply firewall rules: sudo paqctl firewall (option 1)" firewall
             fi
         fi
 
         if [ "$ROLE" = "client" ] && is_running; then
-            if ss -tlnp 2>/dev/null | grep -q ":${SOCKS_PORT}"; then
-                echo -e "  ${GREEN}✓${NC} SOCKS5 port $SOCKS_PORT is listening"
+            local _socks_vio
+            _socks_vio=$(_gfk_client_socks_port)
+            if ss -tlnp 2>/dev/null | grep -q ":${_socks_vio} "; then
+                _hc ok "SOCKS5 port ${_socks_vio} is listening"
             else
-                echo -e "  ${RED}✗${NC} SOCKS5 port $SOCKS_PORT is not listening"
-                issues=$((issues + 1))
+                _hc fail "SOCKS5 port ${_socks_vio} not listening" "Check the logs: sudo paqctl logs --backend gfk --errors --no-follow"
+            fi
+        fi
+    else
+        if [ -x "$INSTALL_DIR/bin/paqet" ]; then
+            _hc ok "paqet binary found"
+        else
+            _hc fail "paqet binary not found at $INSTALL_DIR/bin/paqet" "Reinstall it: sudo paqctl update"
+        fi
+
+        if [ -f "$INSTALL_DIR/config.yaml" ]; then
+            _hc ok "Configuration file found"
+        elif [ -n "${INTERFACE:-}" ] && [ -n "${LOCAL_IP:-}" ] && [ -n "${GATEWAY_MAC:-}" ] && [ -n "${ENCRYPTION_KEY:-}" ]; then
+            _hc fail "Configuration file missing" "Regenerate it from settings: sudo paqctl doctor --fix" regen-config
+        else
+            _hc fail "Configuration file missing" "Create it: sudo paqctl config"
+        fi
+
+        if is_running; then
+            _hc ok "paqet is running"
+        else
+            _hc fail "paqet is not running" "Start it: sudo paqctl start (logs: sudo paqctl logs --errors --no-follow)" start
+        fi
+
+        if ldconfig -p 2>/dev/null | grep -q libpcap; then
+            _hc ok "libpcap is available"
+        else
+            _hc warn "libpcap not found in ldconfig (may still work)" "Install it: apt install libpcap0.8 | dnf install libpcap | apk add libpcap"
+        fi
+
+        if [ "$ROLE" = "server" ]; then
+            if _hc_iptables_has -t raw -C PREROUTING -p tcp --dport "$LISTEN_PORT" -m comment --comment "paqctl" -j NOTRACK; then
+                _hc ok "iptables NOTRACK rules in place (port $LISTEN_PORT)"
+            else
+                _hc fail "iptables NOTRACK rules missing for port $LISTEN_PORT" "Apply firewall rules: sudo paqctl firewall (option 1)" firewall
+            fi
+            if _hc_iptables_has -t mangle -C OUTPUT -p tcp --sport "$LISTEN_PORT" -m comment --comment "paqctl" --tcp-flags RST RST -j DROP; then
+                _hc ok "iptables RST DROP rule in place"
+            else
+                _hc fail "iptables RST DROP rule missing" "Apply firewall rules: sudo paqctl firewall (option 1)" firewall
+            fi
+            if is_running; then
+                if ss -tlnp 2>/dev/null | grep -q ":${LISTEN_PORT}"; then
+                    _hc ok "Port $LISTEN_PORT is listening"
+                else
+                    _hc info "Port $LISTEN_PORT not shown in ss (expected: paqet uses raw sockets)"
+                fi
             fi
         fi
 
-        # 7. Paqet ping test
+        if [ "$ROLE" = "client" ] && is_running; then
+            if [ "${ROUTING_MODE:-socks5}" = "forward" ]; then
+                if ss -tlnp 2>/dev/null | grep -q ":${FORWARD_PORT:-14000} "; then
+                    _hc ok "Forward port ${FORWARD_PORT:-14000} is listening"
+                else
+                    _hc fail "Forward port ${FORWARD_PORT:-14000} is not listening" "Check the logs: sudo paqctl logs --errors --no-follow"
+                fi
+            elif ss -tlnp 2>/dev/null | grep -q ":${SOCKS_PORT}"; then
+                _hc ok "SOCKS5 port $SOCKS_PORT is listening"
+            else
+                _hc fail "SOCKS5 port $SOCKS_PORT is not listening" "Check the logs: sudo paqctl logs --errors --no-follow"
+            fi
+        fi
+
         if is_running && [ -x "$INSTALL_DIR/bin/paqet" ]; then
-            echo -e "  ${DIM}Running paqet ping test...${NC}"
+            [ "$JSON_OUTPUT" = true ] || [ "$_HC_QUIET" = true ] || echo -e "  ${DIM}Running paqet ping test...${NC}"
             local ping_result
             ping_result=$(timeout 10 "$INSTALL_DIR/bin/paqet" ping -c "$INSTALL_DIR/config.yaml" 2>&1 || true)
             if echo "$ping_result" | grep -qi "success\|pong\|ok\|alive\|rtt"; then
-                echo -e "  ${GREEN}✓${NC} Paqet ping: OK"
+                _hc ok "Paqet ping: OK"
             elif [ -n "$ping_result" ]; then
-                echo -e "  ${YELLOW}!${NC} Paqet ping: $(echo "$ping_result" | head -1)"
+                _hc warn "Paqet ping: $(echo "$ping_result" | head -1)" "Run it interactively: sudo paqctl ping"
             else
-                echo -e "  ${YELLOW}!${NC} Paqet ping: no response (may not be supported)"
+                _hc warn "Paqet ping: no response (may not be supported)"
             fi
         fi
     fi
 
-    # 8. Network connectivity
+    [ "$doctor" = true ] && _run_doctor_checks
+
     if curl -s --max-time 5 https://api.github.com &>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} Internet connectivity: OK"
+        _hc ok "Internet connectivity: OK"
     else
-        echo -e "  ${YELLOW}!${NC} Cannot reach GitHub API (may be firewall/network)"
+        _hc warn "Cannot reach GitHub API (may be firewall/network)" "Check DNS and outbound HTTPS: curl -v https://api.github.com"
     fi
 
-    # 9. Systemd service
-    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
-        if systemctl is-enabled paqctl.service &>/dev/null; then
-            echo -e "  ${GREEN}✓${NC} Auto-start on boot: enabled"
+    if _boot_enabled; then
+        _hc ok "Auto-start on boot: enabled"
+    elif _init_system >/dev/null; then
+        _hc warn "Auto-start on boot: disabled" "Enable it: sudo paqctl enable" enable-boot
+    fi
+}
+
+# Extra checks that only 'paqctl doctor' runs (environment drift, conflicts)
+_run_doctor_checks() {
+    if [ "$BACKEND" != "gfw-knocker" ]; then
+        local iface="${INTERFACE:-}"
+        if [ -n "$iface" ] && ip link show "$iface" &>/dev/null; then
+            _hc ok "Interface $iface exists"
+
+            if [ -n "${LOCAL_IP:-}" ]; then
+                if ip -4 addr show dev "$iface" 2>/dev/null | grep -qw "inet ${LOCAL_IP}"; then
+                    _hc ok "Local IP ${LOCAL_IP} is assigned to $iface"
+                else
+                    local cur_ip
+                    cur_ip=$(ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1)
+                    _hc fail "Local IP ${LOCAL_IP} is no longer assigned to $iface${cur_ip:+ (now: $cur_ip)}" \
+                        "Update it: sudo paqctl config set LOCAL_IP=${cur_ip:-<ip>}"
+                fi
+            fi
+
+            local gw gw_mac=""
+            gw=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
+            [ -n "$gw" ] && gw_mac=$(ip neigh show "$gw" 2>/dev/null | awk '/lladdr/{print $5; exit}')
+            if [ -n "$gw_mac" ] && [ -n "${GATEWAY_MAC:-}" ]; then
+                if [ "${gw_mac,,}" = "${GATEWAY_MAC,,}" ]; then
+                    _hc ok "Gateway MAC matches ($gw_mac)"
+                else
+                    _hc fail "Gateway MAC changed: configured ${GATEWAY_MAC}, current ${gw_mac}" \
+                        "Update it: sudo paqctl config set GATEWAY_MAC=${gw_mac}"
+                fi
+            fi
+
+            local if_mtu kcp_mtu="${KCP_MTU:-1350}"
+            if_mtu=$(cat "/sys/class/net/$iface/mtu" 2>/dev/null || true)
+            if [[ "$if_mtu" =~ ^[0-9]+$ ]] && [[ "$kcp_mtu" =~ ^[0-9]+$ ]]; then
+                # Leave room for IP/TCP headers (and IPv6 / nested tunnels)
+                if [ "$kcp_mtu" -gt $((if_mtu - 100)) ]; then
+                    _hc warn "KCP MTU ${kcp_mtu} leaves little headroom on $iface (MTU ${if_mtu})" \
+                        "Lower it on both ends: sudo paqctl config set KCP_MTU=$((if_mtu - 150))"
+                else
+                    _hc ok "KCP MTU ${kcp_mtu} fits interface MTU ${if_mtu}"
+                fi
+            fi
         else
-            echo -e "  ${YELLOW}!${NC} Auto-start on boot: disabled"
+            local def_if
+            def_if=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+            _hc fail "Network interface '${iface:-<unset>}' not found" "Update it: sudo paqctl config set INTERFACE=${def_if:-<name>}"
+        fi
+
+        if [ "$ROLE" = "client" ] && [ "${ROUTING_MODE:-socks5}" != "forward" ] && ! is_paqet_running; then
+            if ss -tlnp 2>/dev/null | grep -qE "[:.]${SOCKS_PORT:-1080}[[:space:]]"; then
+                _hc fail "SOCKS5 port ${SOCKS_PORT:-1080} is already used by another process" \
+                    "Free the port (ss -tlnp | grep :${SOCKS_PORT:-1080}) or pick another: sudo paqctl config set SOCKS_PORT=<port>"
+            fi
+        fi
+
+        if [ -f "$INSTALL_DIR/config.yaml" ] && [ -n "${ENCRYPTION_KEY:-}" ]; then
+            if grep -qF -- "$ENCRYPTION_KEY" "$INSTALL_DIR/config.yaml"; then
+                _hc ok "config.yaml matches settings.conf (key)"
+            else
+                _hc fail "config.yaml key differs from settings.conf (manual edit or interrupted key rotation?)" \
+                    "Regenerate config.yaml from settings: sudo paqctl doctor --fix" regen-config
+            fi
         fi
     fi
 
-    echo ""
-    if [ "$issues" -eq 0 ]; then
-        echo -e "  ${GREEN}${BOLD}All checks passed!${NC}"
-    else
-        echo -e "  ${RED}${BOLD}$issues issue(s) found${NC}"
+    local avail mnt
+    avail=$(df -Pk "$INSTALL_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+    mnt=$(df -Pk "$INSTALL_DIR" 2>/dev/null | awk 'NR==2{print $6}')
+    if [[ "$avail" =~ ^[0-9]+$ ]]; then
+        if [ "$avail" -lt 51200 ]; then
+            _hc warn "Low disk space on ${mnt:-/}: $((avail / 1024)) MB free" "Free some space: sudo paqctl cleanup --journal"
+        else
+            _hc ok "Disk space OK ($((avail / 1024)) MB free on ${mnt:-/})"
+        fi
     fi
-    echo ""
+
+    if command -v getent &>/dev/null; then
+        if getent hosts github.com &>/dev/null; then
+            _hc ok "DNS resolution works"
+        else
+            _hc warn "DNS resolution failed (github.com)" "Check /etc/resolv.conf"
+        fi
+    fi
+
+    if [ "${WATCHDOG_ENABLED:-false}" != "true" ]; then
+        _hc info "Self-healing watchdog is off (optional: sudo paqctl watchdog enable)"
+    fi
+}
+
+# Print the summary (text) or the whole result set (JSON). Returns 1 if any check failed.
+_hc_report() {
+    if [ "$JSON_OUTPUT" = true ]; then
+        local first=true r st msg hint fix
+        printf '{"ok":%s,"failures":%d,"warnings":%d,"checks":[' \
+            "$(_json_bool "$([ "$_HC_FAILS" -eq 0 ] && echo true)")" "$_HC_FAILS" "$_HC_WARNS"
+        for r in "${_HC_RESULTS[@]}"; do
+            IFS=$'\x1f' read -r st msg hint fix <<< "$r"
+            [ "$first" = true ] || printf ','
+            first=false
+            printf '{"status":%s,"message":%s' "$(_json_str "$st")" "$(_json_str "$msg")"
+            [ -n "$hint" ] && printf ',"hint":%s' "$(_json_str "$hint")"
+            [ -n "$fix" ] && printf ',"fixable":true'
+            printf '}'
+        done
+        printf ']}\n'
+    else
+        echo ""
+        if [ "$_HC_FAILS" -eq 0 ]; then
+            if [ "$_HC_WARNS" -gt 0 ]; then
+                echo -e "  ${GREEN}${BOLD}All checks passed${NC} (${_HC_WARNS} warning(s))"
+            else
+                echo -e "  ${GREEN}${BOLD}All checks passed!${NC}"
+            fi
+        else
+            echo -e "  ${RED}${BOLD}${_HC_FAILS} issue(s) found${NC}"
+            [ "$_HC_SHOW_HINTS" = true ] || echo -e "  ${DIM}Run 'sudo paqctl doctor' for suggested fixes.${NC}"
+        fi
+        echo ""
+    fi
+    [ "$_HC_FAILS" -eq 0 ]
+}
+
+health_check() {
+    _print_section "HEALTH CHECK"
+    _HC_SHOW_HINTS=false
+    _run_health_checks false
+    _hc_report
+}
+
+# Fix ids of failing/warning checks, de-duplicated, in order
+_hc_fix_ids() {
+    local r st msg hint fix seen=" "
+    for r in "${_HC_RESULTS[@]}"; do
+        IFS=$'\x1f' read -r st msg hint fix <<< "$r"
+        [ -n "$fix" ] && [ "$st" != "ok" ] || continue
+        case "$seen" in *" $fix "*) continue ;; esac
+        seen="${seen}${fix} "
+        echo "$fix"
+    done
+}
+
+run_doctor() {
+    local do_fix=false a
+    for a in "$@"; do
+        case "$a" in
+            --fix) do_fix=true ;;
+            *) log_error "Unknown option for doctor: $a"; echo "  Usage: paqctl doctor [--fix] [--json]" >&2; return 2 ;;
+        esac
+    done
+
+    _print_section "DOCTOR"
+    _HC_SHOW_HINTS=true
+    _run_health_checks true
+
+    local -a fixes=()
+    local f
+    while IFS= read -r f; do [ -n "$f" ] && fixes+=("$f"); done < <(_hc_fix_ids)
+
+    if [ "$do_fix" != true ] || [ ${#fixes[@]} -eq 0 ]; then
+        if [ "$JSON_OUTPUT" != true ] && [ ${#fixes[@]} -gt 0 ]; then
+            echo ""
+            echo -e "  ${CYAN}${#fixes[@]} problem type(s) can be fixed automatically: ${BOLD}sudo paqctl doctor --fix${NC}"
+        fi
+        _hc_report
+        return
+    fi
+
+    echo "" | _log_fd
+    log_info "Applying fixes: ${fixes[*]}"
+    local need_start=false need_restart=false
+    for f in "${fixes[@]}"; do
+        case "$f" in
+            firewall)
+                if _apply_firewall; then log_success "Firewall rules applied"; else log_error "Could not apply firewall rules"; fi ;;
+            regen-config)
+                if _write_paqet_config; then log_success "config.yaml regenerated from settings.conf"; need_restart=true; fi ;;
+            enable-boot)
+                _set_boot enable || true ;;
+            start)
+                need_start=true ;;
+        esac
+    done
+    if [ "$need_restart" = true ] && is_running; then
+        { restart_paqet || true; } | _log_fd
+    elif [ "$need_start" = true ] || [ "$need_restart" = true ]; then
+        { start_paqet || true; } | _log_fd
+    fi
+
+    # Re-check and show what is still wrong
+    _HC_QUIET=true
+    _run_health_checks true
+    _HC_QUIET=false
+    if [ "$JSON_OUTPUT" != true ]; then
+        echo ""
+        echo -e "  ${BOLD}After fixes:${NC}"
+        local r st msg hint fix remaining=0
+        for r in "${_HC_RESULTS[@]}"; do
+            IFS=$'\x1f' read -r st msg hint fix <<< "$r"
+            if [ "$st" = "fail" ] || [ "$st" = "warn" ]; then
+                _hc_print_line "$st" "$msg" "$hint"
+                remaining=$((remaining + 1))
+            fi
+        done
+        [ "$remaining" -eq 0 ] && echo -e "  ${GREEN}✓${NC} No remaining problems"
+    fi
+    _hc_report
 }
 
 #═══════════════════════════════════════════════════════════════════════
@@ -4769,6 +5341,10 @@ except: pass
     if [ "$current" = "$latest_tag" ]; then
         echo ""
         log_success "You are already on the latest version!"
+        if [ "$ASSUME_YES" = true ] || ! _has_tty; then
+            update_management_script
+            return
+        fi
         echo ""
         echo -e "  ${DIM}Options:${NC}"
         echo "  1. Force reinstall current version"
@@ -4779,8 +5355,7 @@ except: pass
         read -p "  Choice: " up_choice < /dev/tty || true
         case "$up_choice" in
             1)
-                read -p "  Force reinstall ${current}? [y/N]: " _fc < /dev/tty || true
-                [[ "$_fc" =~ ^[Yy]$ ]] || { log_info "Cancelled"; return 0; }
+                _confirm "Force reinstall ${current}?" || { log_info "Cancelled"; return 0; }
                 ;;
             2) rollback_paqet; return ;;
             3) update_management_script; return ;;
@@ -4808,10 +5383,9 @@ except: pass
     echo -e "${YELLOW}║${NC}  You can rollback with: ${BOLD}sudo paqctl rollback${NC}"
     echo -e "${YELLOW}╚════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    read -p "  Update to ${latest_tag}? [y/N]: " confirm < /dev/tty || true
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    if ! _confirm "Update to ${latest_tag}?"; then
         log_info "Update cancelled"
-        return 0
+        return 1
     fi
 
     # Download new binary
@@ -5018,32 +5592,38 @@ update_management_script() {
     tmp_script=$(mktemp "/tmp/paqctl-update-XXXXXXXX.sh")
 
     log_info "Checking for management script updates..."
-    if ! curl -sL --max-time 30 --max-filesize 2097152 -o "$tmp_script" "$update_url" 2>/dev/null; then
-        log_warn "Could not check for script updates"
+    if ! curl -sfL --max-time 30 --max-filesize 4194304 -o "$tmp_script" "$update_url" 2>/dev/null; then
+        log_warn "Could not download the management script update"
         rm -f "$tmp_script"
-        return 0
+        return 1
     fi
 
     # Validate: must contain our markers, be a bash script, and pass syntax check
     if ! head -n 1 "$tmp_script" 2>/dev/null | grep -q "^#!.*bash"; then
         log_warn "Downloaded file is not a bash script, skipping"
         rm -f "$tmp_script"
-        return 0
+        return 1
     fi
+    local _rc=0
     if grep -q "PAQET_REPO=" "$tmp_script" && \
        grep -q "create_management_script" "$tmp_script" && \
        grep -q "PAQCTL_VERSION=" "$tmp_script" && \
        bash -n "$tmp_script" 2>/dev/null; then
+        local _new_ver
+        _new_ver=$(grep -m1 '^VERSION=' "$tmp_script" | cut -d'"' -f2)
         local _update_output
         if _update_output=$(bash "$tmp_script" --update-components 2>&1); then
-            log_success "Management script updated"
+            log_success "Management script updated (${VERSION} → ${_new_ver:-unknown})"
         else
             log_warn "Management script update execution failed: ${_update_output:-unknown error}"
+            _rc=1
         fi
     else
         log_warn "Downloaded script failed validation, skipping"
+        _rc=1
     fi
     rm -f "$tmp_script"
+    return $_rc
 }
 
 #═══════════════════════════════════════════════════════════════════════
@@ -5324,11 +5904,13 @@ change_config() {
     local _warn_text="config"
     [ "$BACKEND" = "gfw-knocker" ] && _warn_text="parameters.py"
     echo -e "  ${YELLOW}Warning: This will regenerate ${_warn_text} and restart ${BACKEND}.${NC}"
+    echo -e "  ${DIM}Non-interactive alternative: sudo paqctl config set KEY=VALUE (see: paqctl help config)${NC}"
     echo ""
-    read -p "  Continue? [y/N]: " confirm < /dev/tty || true
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        return 0
+    if ! _has_tty; then
+        log_error "Interactive configuration needs a terminal. Use: paqctl config set KEY=VALUE"
+        return 1
     fi
+    _confirm "Continue?" || return 0
 
     local was_running=false
     is_running && was_running=true
@@ -5444,159 +6026,21 @@ change_config() {
     fi
     [ -n "$input" ] && PAQET_TCP_REMOTE_FLAG="$input"
 
-    # Save
-    local IFACE="$INTERFACE"
-    local GW_MAC="$GATEWAY_MAC"
-    # Regenerate YAML
-    local tmp_conf
-    tmp_conf=$(mktemp "$INSTALL_DIR/config.yaml.XXXXXXXX")
     # Validate required fields
     if [ -z "$INTERFACE" ] || [ -z "$LOCAL_IP" ] || [ -z "$GATEWAY_MAC" ] || [ -z "$ENCRYPTION_KEY" ]; then
         log_error "Missing required configuration fields"
-        rm -f "$tmp_conf"
         [ "$was_running" = true ] && start_paqet
         return 1
     fi
 
-    # Escape YAML special characters to prevent injection
-    _escape_yaml() {
-        local s="$1"
-        if [[ "$s" =~ [:\#\[\]{}\"\'\|\>\<\&\*\!\%\@\`] ]] || [[ "$s" =~ ^[[:space:]] ]] || [[ "$s" =~ [[:space:]]$ ]]; then
-            s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '"%s"' "$s"
-        else
-            printf '%s' "$s"
-        fi
-    }
-    # Set permissions before writing
-    chmod 600 "$tmp_conf" 2>/dev/null
-    (
-    umask 077
-    local _y_iface _y_ip _y_mac _y_key _y_server _tcp_local_flags _tcp_remote_flags
-    _y_iface=$(_escape_yaml "$INTERFACE")
-    _y_ip=$(_escape_yaml "$LOCAL_IP")
-    _y_mac=$(_escape_yaml "$GATEWAY_MAC")
-    _y_key=$(_escape_yaml "$ENCRYPTION_KEY")
-    _tcp_local_flags=$(echo "${PAQET_TCP_LOCAL_FLAG:-PA}" | sed 's/,/", "/g; s/.*/["&"]/')
-    _tcp_remote_flags=$(echo "${PAQET_TCP_REMOTE_FLAG:-PA}" | sed 's/,/", "/g; s/.*/["&"]/')
-    if [ "$ROLE" = "server" ]; then
-        cat > "$tmp_conf" << EOF
-role: "server"
-
-log:
-  level: "info"
-
-listen:
-  addr: ":${LISTEN_PORT}"
-
-network:
-  interface: "${_y_iface}"
-  ipv4:
-    addr: "${_y_ip}:${LISTEN_PORT}"
-    router_mac: "${_y_mac}"
-  tcp:
-    local_flag: ${_tcp_local_flags}
-    remote_flag: ${_tcp_remote_flags}
-
-transport:
-  protocol: "kcp"
-  kcp:
-    mode: "fast"
-    key: "${_y_key}"
-EOF
-    else
-        _y_server=$(_escape_yaml "$REMOTE_SERVER")
-        cat > "$tmp_conf" << EOF
-role: "client"
-
-log:
-  level: "info"
-
-socks5:
-  - listen: "127.0.0.1:${SOCKS_PORT}"
-
-network:
-  interface: "${_y_iface}"
-  ipv4:
-    addr: "${_y_ip}:0"
-    router_mac: "${_y_mac}"
-  tcp:
-    local_flag: ${_tcp_local_flags}
-    remote_flag: ${_tcp_remote_flags}
-
-server:
-  addr: "${_y_server}"
-
-transport:
-  protocol: "kcp"
-  kcp:
-    mode: "fast"
-    key: "${_y_key}"
-EOF
-    fi
-    )
-    if ! mv "$tmp_conf" "$INSTALL_DIR/config.yaml"; then
+    # Regenerate config.yaml and settings.conf from the shared writers so
+    # tuning (KCP_*), routing, turbo and watchdog settings are preserved.
+    if ! _write_paqet_config "$INSTALL_DIR/config.yaml"; then
         log_error "Failed to save configuration"
-        rm -f "$tmp_conf"
         [ "$was_running" = true ] && start_paqet
         return 1
     fi
-    chmod 600 "$INSTALL_DIR/config.yaml" 2>/dev/null
-
-    # Save settings
-    local _tmp
-    _tmp=$(mktemp "$INSTALL_DIR/settings.conf.XXXXXXXX")
-    # Read current telegram settings
-    local _tg_token="${TELEGRAM_BOT_TOKEN:-}"
-    local _tg_chat="${TELEGRAM_CHAT_ID:-}"
-    local _tg_interval="${TELEGRAM_INTERVAL:-6}"
-    local _tg_enabled="${TELEGRAM_ENABLED:-false}"
-    local _tg_alerts="${TELEGRAM_ALERTS_ENABLED:-true}"
-    local _tg_daily="${TELEGRAM_DAILY_SUMMARY:-true}"
-    local _tg_weekly="${TELEGRAM_WEEKLY_SUMMARY:-true}"
-    local _tg_label="${TELEGRAM_SERVER_LABEL:-}"
-    local _tg_start_hour="${TELEGRAM_START_HOUR:-0}"
-    (
-    umask 077
-    cat > "$_tmp" << EOF
-BACKEND="${BACKEND:-paqet}"
-ROLE="${ROLE}"
-PAQET_VERSION="${PAQET_VERSION}"
-PAQCTL_VERSION="${VERSION}"
-LISTEN_PORT="${LISTEN_PORT:-}"
-SOCKS_PORT="${SOCKS_PORT:-}"
-INTERFACE="${INTERFACE}"
-LOCAL_IP="${LOCAL_IP}"
-GATEWAY_MAC="${GATEWAY_MAC}"
-ENCRYPTION_KEY="${ENCRYPTION_KEY}"
-REMOTE_SERVER="${REMOTE_SERVER:-}"
-GFK_VIO_PORT="${GFK_VIO_PORT:-}"
-GFK_QUIC_PORT="${GFK_QUIC_PORT:-}"
-GFK_AUTH_CODE="${GFK_AUTH_CODE:-}"
-GFK_PORT_MAPPINGS="${GFK_PORT_MAPPINGS:-}"
-GFK_SOCKS_PORT="${GFK_SOCKS_PORT:-}"
-GFK_SOCKS_VIO_PORT="${GFK_SOCKS_VIO_PORT:-}"
-XRAY_PANEL_DETECTED="${XRAY_PANEL_DETECTED:-false}"
-MICROSOCKS_PORT="${MICROSOCKS_PORT:-}"
-GFK_SERVER_IP="${GFK_SERVER_IP:-}"
-GFK_TCP_FLAGS="${GFK_TCP_FLAGS:-AP}"
-PAQET_TCP_LOCAL_FLAG="${PAQET_TCP_LOCAL_FLAG:-PA}"
-PAQET_TCP_REMOTE_FLAG="${PAQET_TCP_REMOTE_FLAG:-PA}"
-TELEGRAM_BOT_TOKEN="${_tg_token}"
-TELEGRAM_CHAT_ID="${_tg_chat}"
-TELEGRAM_INTERVAL=${_tg_interval}
-TELEGRAM_ENABLED=${_tg_enabled}
-TELEGRAM_ALERTS_ENABLED=${_tg_alerts}
-TELEGRAM_DAILY_SUMMARY=${_tg_daily}
-TELEGRAM_WEEKLY_SUMMARY=${_tg_weekly}
-TELEGRAM_SERVER_LABEL="${_tg_label}"
-TELEGRAM_START_HOUR=${_tg_start_hour}
-EOF
-    )
-    if ! mv "$_tmp" "$INSTALL_DIR/settings.conf"; then
-        log_error "Failed to save settings"
-        rm -f "$_tmp"
-    fi
-    chmod 600 "$INSTALL_DIR/settings.conf" 2>/dev/null
+    save_settings || log_error "Failed to save settings"
 
     log_success "Configuration updated"
 
@@ -5609,56 +6053,174 @@ EOF
 # Backup & Restore
 #═══════════════════════════════════════════════════════════════════════
 
+# Files (relative to $INSTALL_DIR) that make up a paqctl configuration
+_BACKUP_FILES=(config.yaml settings.conf banned_ips gfk/parameters.py gfk/cert.pem gfk/key.pem bin/gfk-client.sh)
+PAQCTL_BACKUP_KEEP="${PAQCTL_BACKUP_KEEP:-10}"
+
+# Newest first
+_list_backups() {
+    [ -d "$BACKUP_DIR" ] || return 0
+    ls -1t "$BACKUP_DIR"/paqctl-backup-*.tar.gz 2>/dev/null || true
+}
+
+_prune_backups() {
+    local keep="$PAQCTL_BACKUP_KEEP" f n=0 removed=0
+    [[ "$keep" =~ ^[0-9]+$ ]] && [ "$keep" -ge 1 ] || keep=10
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        n=$((n + 1))
+        if [ "$n" -gt "$keep" ]; then
+            rm -f "$f" && removed=$((removed + 1))
+        fi
+    done < <(_list_backups)
+    echo "$removed"
+}
+
+# backup_config [--quiet] [--label NAME] [--no-prune]
+# Prints the backup path on stdout when --quiet is given.
 backup_config() {
+    local quiet=false label="" prune=true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --quiet) quiet=true; shift ;;
+            --label) label="${2:-}"; shift 2 ;;
+            --no-prune) prune=false; shift ;;
+            *) log_error "Unknown option for backup: $1"; return 2 ;;
+        esac
+    done
     (umask 077; mkdir -p "$BACKUP_DIR")
     chmod 700 "$BACKUP_DIR" 2>/dev/null
-    local ts=$(date +%Y%m%d%H%M%S)
-    local backup_file="$BACKUP_DIR/paqctl-backup-${ts}.tar.gz"
 
-    if ! (umask 077; tar -czf "$backup_file" \
-        -C "$INSTALL_DIR" \
-        config.yaml settings.conf 2>/dev/null); then
+    local -a members=()
+    local m
+    for m in "${_BACKUP_FILES[@]}"; do
+        [ -f "$INSTALL_DIR/$m" ] && members+=("$m")
+    done
+    if [ ${#members[@]} -eq 0 ]; then
+        log_error "Nothing to back up (no configuration files found in $INSTALL_DIR)"
+        return 1
+    fi
+
+    local ts backup_file i=1
+    ts=$(date +%Y%m%d%H%M%S)
+    [[ "$label" =~ ^[a-z0-9-]+$ ]] && ts="${ts}-${label}"
+    backup_file="$BACKUP_DIR/paqctl-backup-${ts}.tar.gz"
+    while [ -e "$backup_file" ]; do
+        backup_file="$BACKUP_DIR/paqctl-backup-${ts}-${i}.tar.gz"
+        i=$((i + 1))
+    done
+
+    if ! (umask 077; tar -czf "$backup_file" -C "$INSTALL_DIR" "${members[@]}" 2>/dev/null); then
         log_error "Failed to create backup archive"
         rm -f "$backup_file"
         return 1
     fi
-    echo ""
-    log_success "Backup saved to: $backup_file"
-    echo ""
+    local pruned=0
+    [ "$prune" = true ] && pruned=$(_prune_backups)
+
+    if [ "$quiet" = true ]; then
+        echo "$backup_file"
+    else
+        echo ""
+        log_success "Backup saved to: $backup_file"
+        echo -e "  ${DIM}Contains: ${members[*]}${NC}"
+        [ "$pruned" -gt 0 ] 2>/dev/null && echo -e "  ${DIM}Removed $pruned old backup(s); keeping the newest ${PAQCTL_BACKUP_KEEP}.${NC}"
+        echo ""
+    fi
 }
 
+# Refuse archives containing anything other than known config files
+_backup_members_ok() {
+    local archive="$1" entry allowed ok
+    local listing
+    listing=$(tar -tzf "$archive" 2>/dev/null) || return 1
+    [ -n "$listing" ] || return 1
+    while IFS= read -r entry; do
+        entry="${entry#./}"
+        [ -z "$entry" ] && continue
+        ok=false
+        for allowed in "${_BACKUP_FILES[@]}" gfk/ bin/; do
+            [ "$entry" = "$allowed" ] && { ok=true; break; }
+        done
+        if [ "$ok" != true ]; then
+            log_error "Backup contains an unexpected file: $entry"
+            return 1
+        fi
+    done <<< "$listing"
+}
+
+# restore_config [FILE | latest | N]
 restore_config() {
     echo ""
-    if [ ! -d "$BACKUP_DIR" ] || [ -z "$(ls -A "$BACKUP_DIR"/*.tar.gz 2>/dev/null)" ]; then
-        log_warn "No backups found in $BACKUP_DIR"
+    local -a backups=()
+    local f
+    while IFS= read -r f; do [ -n "$f" ] && backups+=("$f"); done < <(_list_backups)
+
+    local selected="" arg="${1:-}"
+    if [ -n "$arg" ]; then
+        if [ "$arg" = "latest" ]; then
+            [ ${#backups[@]} -gt 0 ] || { log_warn "No backups found in $BACKUP_DIR"; return 1; }
+            selected="${backups[0]}"
+        elif [[ "$arg" =~ ^[0-9]+$ ]]; then
+            if [ "$arg" -lt 1 ] || [ "$arg" -gt ${#backups[@]} ]; then
+                log_error "No backup #$arg (have ${#backups[@]}; newest is #1)"
+                return 1
+            fi
+            selected="${backups[$((arg - 1))]}"
+        elif [ -f "$arg" ]; then
+            selected="$arg"
+        elif [ -f "$BACKUP_DIR/$arg" ]; then
+            selected="$BACKUP_DIR/$arg"
+        else
+            log_error "Backup not found: $arg"
+            return 1
+        fi
+    else
+        if [ ${#backups[@]} -eq 0 ]; then
+            log_warn "No backups found in $BACKUP_DIR"
+            return 1
+        fi
+        if ! _has_tty; then
+            log_error "No terminal for interactive selection. Use: paqctl restore latest | paqctl restore <file>"
+            return 1
+        fi
+        echo -e "${BOLD}Available backups (newest first):${NC}"
+        echo ""
+        local i=1
+        for f in "${backups[@]}"; do
+            echo "  $i. $(basename "$f")"
+            i=$((i + 1))
+        done
+        echo ""
+        echo "  0. Cancel"
+        echo ""
+        local choice
+        read -r -p "  Select backup [0-${#backups[@]}]: " choice < /dev/tty || true
+        if [ "$choice" = "0" ] || [ -z "$choice" ]; then
+            log_info "Cancelled"
+            return 0
+        fi
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#backups[@]} ]; then
+            log_error "Invalid choice"
+            return 1
+        fi
+        selected="${backups[$((choice - 1))]}"
+    fi
+
+    if ! _backup_members_ok "$selected"; then
+        log_error "Refusing to restore $(basename "$selected"): not a valid paqctl backup"
         return 1
     fi
 
-    echo -e "${BOLD}Available backups:${NC}"
-    echo ""
-    local i=1
-    local backups=()
-    for f in "$BACKUP_DIR"/*.tar.gz; do
-        backups+=("$f")
-        echo "  $i. $(basename "$f")"
-        i=$((i + 1))
-    done
-    echo ""
-    echo "  0. Cancel"
-    echo ""
-    read -p "  Select backup [0-${#backups[@]}]: " choice < /dev/tty || true
-    if [ "$choice" = "0" ]; then
-        log_info "Cancelled"
-        return 0
-    fi
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#backups[@]} ]; then
-        log_error "Invalid choice"
-        return 1
+    _confirm "Restore $(basename "$selected")? Your current configuration is backed up first." || { log_info "Cancelled"; return 1; }
+
+    # Safety net. No pruning here so the archive being restored is never removed.
+    local safety
+    if safety=$(backup_config --quiet --label pre-restore --no-prune 2>/dev/null); then
+        log_info "Current configuration saved to: $safety"
     fi
 
-    local selected="${backups[$((choice-1))]}"
     log_info "Restoring from: $(basename "$selected")"
-
     local was_running=false
     is_running && was_running=true
     [ "$was_running" = true ] && stop_paqet
@@ -5668,15 +6230,23 @@ restore_config() {
         [ "$was_running" = true ] && start_paqet
         return 1
     fi
-    chmod 600 "$INSTALL_DIR/config.yaml" "$INSTALL_DIR/settings.conf" 2>/dev/null
-    chown root:root "$INSTALL_DIR/config.yaml" "$INSTALL_DIR/settings.conf" 2>/dev/null
+    local m
+    for m in "${_BACKUP_FILES[@]}"; do
+        [ -f "$INSTALL_DIR/$m" ] || continue
+        chown root:root "$INSTALL_DIR/$m" 2>/dev/null
+        case "$m" in
+            bin/*) chmod 700 "$INSTALL_DIR/$m" 2>/dev/null ;;
+            *) chmod 600 "$INSTALL_DIR/$m" 2>/dev/null ;;
+        esac
+    done
 
-    # Reload settings
     _load_settings
-
+    _prune_backups >/dev/null
     log_success "Configuration restored"
 
-    [ "$was_running" = true ] && start_paqet
+    if [ "$was_running" = true ]; then
+        start_paqet || return 1
+    fi
 }
 
 #═══════════════════════════════════════════════════════════════════════
@@ -5786,288 +6356,641 @@ check_proxy_routing() {
     echo ""
 }
 
-manage_ip_ban() {
-    local action="$1"
-    local target_ip="$2"
-    
-    if [ -z "$action" ]; then
-        echo ""
-        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-        echo -e "${BOLD}  IP BAN & ALLOWLIST MANAGER${NC}"
-        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-        echo ""
-        echo "  1. Ban an IP address (Drop traffic)"
-        echo "  2. Unban an IP address"
-        echo "  3. List currently banned IPs"
-        echo "  b. Back"
-        echo ""
-        read -p "  Choice: " ban_choice < /dev/tty || return
-        case "$ban_choice" in
-            1)
-                read -p "  Enter IP address to ban: " target_ip < /dev/tty
-                [ -z "$target_ip" ] && return
-                action="ban"
-                ;;
-            2)
-                read -p "  Enter IP address to unban: " target_ip < /dev/tty
-                [ -z "$target_ip" ] && return
-                action="unban"
-                ;;
-            3)
-                action="list"
-                ;;
-            *) return ;;
-        esac
-    fi
+#───────────────────────────────────────────────────────────────────────
+# IP bans: tagged "paqctl-ban", tracked in $INSTALL_DIR/banned_ips and
+# re-applied by _apply_firewall (service start / boot).
+#───────────────────────────────────────────────────────────────────────
+_BAN_FILE="$INSTALL_DIR/banned_ips"
+_BAN_TAG="paqctl-ban"
 
-    if [ "$action" = "list" ]; then
-        echo ""
-        echo -e "  ${YELLOW}Currently blocked IPs (iptables / firewalld):${NC}"
-        if _is_firewalld_active; then
-            firewall-cmd --direct --get-all-rules 2>/dev/null | grep -i "DROP\|REJECT" || echo "  No direct DROP rules found in firewalld."
-        elif command -v iptables &>/dev/null; then
-            iptables -L INPUT -v -n 2>/dev/null | grep -i "DROP\|REJECT" || echo "  No DROP rules found in iptables INPUT chain."
-        fi
-        echo ""
-        return
+# _parse_ban_target "1.2.3.4" -> "4 1.2.3.4";  "2001:db8::/32" -> "6 2001:db8::/32"
+_parse_ban_target() {
+    local t="$1" addr prefix=""
+    [ -n "$t" ] && [ ${#t} -le 64 ] || return 1
+    addr="${t%%/*}"
+    if [[ "$t" == */* ]]; then
+        prefix="${t#*/}"
+        [[ "$prefix" =~ ^[0-9]{1,3}$ ]] || return 1
     fi
-
-    if [[ ! "$target_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        log_error "Invalid IPv4 address format: $target_ip"
-        return 1
+    if _validate_ip "$addr"; then
+        [ -z "$prefix" ] || [ "$prefix" -le 32 ] || return 1
+        echo "4 $t"
+        return 0
     fi
-
-    if [ "$action" = "ban" ]; then
-        log_info "Banning IP $target_ip..."
-        if _is_firewalld_active; then
-            firewall-cmd --direct --add-rule ipv4 filter INPUT 0 -s "$target_ip" -j DROP 2>/dev/null || true
-        elif command -v iptables &>/dev/null; then
-            iptables -I INPUT -s "$target_ip" -j DROP 2>/dev/null || true
-        fi
-        log_success "IP $target_ip has been banned (DROP)."
-    elif [ "$action" = "unban" ]; then
-        log_info "Unbanning IP $target_ip..."
-        if _is_firewalld_active; then
-            firewall-cmd --direct --remove-rule ipv4 filter INPUT 0 -s "$target_ip" -j DROP 2>/dev/null || true
-        elif command -v iptables &>/dev/null; then
-            iptables -D INPUT -s "$target_ip" -j DROP 2>/dev/null || true
-        fi
-        log_success "IP $target_ip has been unbanned."
+    if [[ "$addr" == *:*:* ]] && [[ "$addr" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$addr" != *:::* ]]; then
+        local without="${addr//::/}"
+        [ $(( (${#addr} - ${#without}) / 2 )) -le 1 ] || return 1
+        local g IFS=':'
+        for g in $addr; do
+            [ ${#g} -le 4 ] || return 1
+        done
+        [ -z "$prefix" ] || [ "$prefix" -le 128 ] || return 1
+        echo "6 $t"
+        return 0
     fi
+    return 1
 }
 
+# _ban_rule add|del|check FAMILY(4|6) ADDR
+_ban_rule() {
+    local op="$1" fam="$2" addr="$3"
+    if _is_firewalld_active; then
+        local ipv="ipv${fam}" rc=1
+        local -a rule=("$ipv" filter INPUT 0 -s "$addr" -m comment --comment "$_BAN_TAG" -j DROP)
+        case "$op" in
+            check) firewall-cmd --direct --query-rule "${rule[@]}" &>/dev/null; return ;;
+            add)
+                firewall-cmd --direct --query-rule "${rule[@]}" &>/dev/null || \
+                    firewall-cmd --direct --add-rule "${rule[@]}" &>/dev/null || return 1
+                firewall-cmd --permanent --direct --add-rule "${rule[@]}" &>/dev/null || true
+                return 0 ;;
+            del)
+                firewall-cmd --direct --remove-rule "${rule[@]}" &>/dev/null && rc=0
+                firewall-cmd --permanent --direct --remove-rule "${rule[@]}" &>/dev/null || true
+                # Untagged rule from older paqctl versions
+                firewall-cmd --direct --remove-rule "$ipv" filter INPUT 0 -s "$addr" -j DROP &>/dev/null && rc=0
+                return $rc ;;
+        esac
+        return 1
+    fi
+    local ipt=iptables
+    [ "$fam" = "6" ] && ipt=ip6tables
+    command -v "$ipt" &>/dev/null || return 1
+    case "$op" in
+        check) "$ipt" -C INPUT -s "$addr" -m comment --comment "$_BAN_TAG" -j DROP 2>/dev/null ;;
+        add)
+            "$ipt" -C INPUT -s "$addr" -m comment --comment "$_BAN_TAG" -j DROP 2>/dev/null || \
+                "$ipt" -I INPUT 1 -s "$addr" -m comment --comment "$_BAN_TAG" -j DROP 2>/dev/null ;;
+        del)
+            local rc=1 n=0
+            while [ $n -lt 20 ] && "$ipt" -D INPUT -s "$addr" -m comment --comment "$_BAN_TAG" -j DROP 2>/dev/null; do rc=0; n=$((n + 1)); done
+            # Untagged rule from older paqctl versions
+            n=0
+            while [ $n -lt 20 ] && "$ipt" -D INPUT -s "$addr" -j DROP 2>/dev/null; do rc=0; n=$((n + 1)); done
+            return $rc ;;
+        *) return 1 ;;
+    esac
+}
+
+_banlist_has() { [ -f "$_BAN_FILE" ] && grep -qxF -- "$1" "$_BAN_FILE"; }
+_banlist_add() {
+    _banlist_has "$1" && return 0
+    (umask 077; echo "$1" >> "$_BAN_FILE")
+}
+_banlist_remove() {
+    [ -f "$_BAN_FILE" ] || return 0
+    local tmp
+    tmp=$(mktemp "${_BAN_FILE}.XXXXXXXX") || return 1
+    grep -vxF -- "$1" "$_BAN_FILE" > "$tmp" || true
+    mv -f "$tmp" "$_BAN_FILE" && chmod 600 "$_BAN_FILE" 2>/dev/null
+}
+
+# Re-apply every tracked ban (idempotent). Called from _apply_firewall.
+_reapply_bans() {
+    [ -s "$_BAN_FILE" ] || return 0
+    local t parsed
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        parsed=$(_parse_ban_target "$t") || continue
+        _ban_rule add "${parsed%% *}" "${parsed#* }" || true
+    done < "$_BAN_FILE"
+}
+
+_ban_list() {
+    local t parsed active first=true
+    if [ "$JSON_OUTPUT" = true ]; then
+        printf '['
+        if [ -s "$_BAN_FILE" ]; then
+            while IFS= read -r t; do
+                [ -n "$t" ] || continue
+                parsed=$(_parse_ban_target "$t") || continue
+                active=false
+                _ban_rule check "${parsed%% *}" "${parsed#* }" && active=true
+                [ "$first" = true ] || printf ','
+                first=false
+                printf '{"target":%s,"active":%s}' "$(_json_str "$t")" "$(_json_bool "$active")"
+            done < "$_BAN_FILE"
+        fi
+        printf ']\n'
+        return 0
+    fi
+    echo ""
+    echo -e "  ${BOLD}IPs banned by paqctl:${NC}"
+    if [ ! -s "$_BAN_FILE" ]; then
+        echo "  (none)"
+    else
+        while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            parsed=$(_parse_ban_target "$t") || { echo -e "  ${YELLOW}?${NC} $t ${DIM}(invalid entry, ignored)${NC}"; continue; }
+            if _ban_rule check "${parsed%% *}" "${parsed#* }"; then
+                echo -e "  ${GREEN}●${NC} $t"
+            else
+                echo -e "  ${RED}○${NC} $t ${DIM}(not active - re-apply with: sudo paqctl firewall → Apply, or restart)${NC}"
+            fi
+        done < "$_BAN_FILE"
+    fi
+    echo ""
+    echo -e "  ${DIM}Only bans made with paqctl are listed. Bans from older paqctl versions can still be removed with: paqctl unban <ip>${NC}"
+    echo ""
+}
+
+# Best-effort address of the SSH session running this command
+_current_ssh_ip() {
+    local ip="${SSH_CLIENT%% *}"
+    [ -z "$ip" ] && ip="${SSH_CONNECTION%% *}"
+    [ -z "$ip" ] && ip=$(who am i 2>/dev/null | sed -n 's/.*(\([^)]*\)).*/\1/p')
+    echo "$ip"
+}
+
+# manage_ip_ban [ban|unban|list] [TARGET]   (no arguments: interactive menu)
+manage_ip_ban() {
+    local action="${1:-}" target="${2:-}"
+
+    if [ -z "$action" ]; then
+        if ! _has_tty; then
+            log_error "Usage: paqctl ban <IP[/CIDR]> | paqctl unban <IP[/CIDR]> | paqctl ban list"
+            return 2
+        fi
+        _print_section "IP BAN MANAGER"
+        echo "  1. Ban an IP address or range (drop all its traffic)"
+        echo "  2. Unban an IP address or range"
+        echo "  3. List banned IPs"
+        echo "  b. Back"
+        echo ""
+        local ban_choice
+        read -r -p "  Choice: " ban_choice < /dev/tty || return 0
+        case "$ban_choice" in
+            1) read -r -p "  IP or CIDR to ban: " target < /dev/tty || return 0; [ -z "$target" ] && return 0; action="ban" ;;
+            2) read -r -p "  IP or CIDR to unban: " target < /dev/tty || return 0; [ -z "$target" ] && return 0; action="unban" ;;
+            3) action="list" ;;
+            *) return 0 ;;
+        esac
+        local _rc=0
+        manage_ip_ban "$action" "$target" || _rc=$?
+        read -n 1 -s -r -p "  Press any key..." < /dev/tty || true
+        return $_rc
+    fi
+
+    if [ "$action" = "list" ] || { [ "$action" = "ban" ] && [ "$target" = "list" ]; }; then
+        _ban_list
+        return 0
+    fi
+
+    if [ -z "$target" ]; then
+        log_error "Usage: paqctl $action <IP[/CIDR]>"
+        return 2
+    fi
+    local parsed
+    if ! parsed=$(_parse_ban_target "$target"); then
+        log_error "Invalid IP address or CIDR range: $target"
+        return 2
+    fi
+    local fam="${parsed%% *}" addr="${parsed#* }"
+    if ! _is_firewalld_active; then
+        local ipt=iptables
+        [ "$fam" = "6" ] && ipt=ip6tables
+        if ! command -v "$ipt" &>/dev/null; then
+            log_error "$ipt not found; cannot manage bans"
+            return 1
+        fi
+    fi
+
+    case "$action" in
+        ban)
+            local me
+            me=$(_current_ssh_ip)
+            if [ -n "$me" ] && [ "$me" = "$addr" ]; then
+                log_warn "$addr is the address of your current SSH session - banning it will lock you out."
+                _confirm "Ban it anyway?" || { log_info "Cancelled"; return 1; }
+            fi
+            if _ban_rule check "$fam" "$addr"; then
+                _banlist_add "$addr"
+                log_info "$addr is already banned"
+                return 0
+            fi
+            if _ban_rule add "$fam" "$addr"; then
+                _banlist_add "$addr"
+                log_success "Banned $addr (persists across restarts and reboots)"
+                return 0
+            fi
+            log_error "Failed to add a firewall rule for $addr"
+            return 1
+            ;;
+        unban)
+            local was_listed=false
+            _banlist_has "$addr" && was_listed=true
+            _banlist_remove "$addr"
+            if _ban_rule del "$fam" "$addr"; then
+                log_success "Unbanned $addr"
+                return 0
+            fi
+            if [ "$was_listed" = true ]; then
+                log_success "Unbanned $addr (its rule was not active)"
+                return 0
+            fi
+            log_warn "$addr was not banned"
+            return 1
+            ;;
+        *)
+            log_error "Unknown ban action: $action"
+            return 2
+            ;;
+    esac
+}
+
+#───────────────────────────────────────────────────────────────────────
+# Credential rotation
+#───────────────────────────────────────────────────────────────────────
 rotate_key() {
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}  ONE-CLICK ENCRYPTION KEY / AUTH CODE ROTATION${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo ""
+    _print_section "ENCRYPTION KEY / AUTH CODE ROTATION"
     _load_settings
     if [ "$ROLE" != "server" ]; then
-        log_warn "Key rotation is typically performed on the server. On clients, use 'Change configuration' or 'Config Import'."
+        log_warn "Key rotation is done on the server. On clients, import the new string: sudo paqctl import '<string>'"
         return 1
     fi
     echo -e "  ${YELLOW}⚠️ WARNING: Rotating the encryption key / auth code will disconnect${NC}"
-    echo -e "  ${YELLOW}   all currently connected clients until they update their key!${NC}"
+    echo -e "  ${YELLOW}   all connected clients until they import the new config string!${NC}"
     echo ""
-    read -p "  Are you sure you want to rotate credentials? [y/N]: " confirm < /dev/tty || return
-    [[ ! "$confirm" =~ ^[yY]$ ]] && { log_info "Rotation cancelled."; return; }
+    _confirm "Rotate credentials now?" || { log_info "Rotation cancelled."; return 1; }
 
+    local bk
+    if ! bk=$(backup_config --quiet --label pre-rotate); then
+        log_error "Could not back up the current configuration; not rotating."
+        return 1
+    fi
+    log_info "Previous credentials backed up to: $bk"
+
+    local was_running=false
+    is_running && was_running=true
+
+    local new_secret label
     if [ "$BACKEND" = "gfw-knocker" ]; then
-        local new_code=$(openssl rand -hex 8 2>/dev/null || echo "gfk$(date +%s)")
-        log_info "Generating new GFK Auth Code: $new_code"
-        _safe_update_setting "GFK_AUTH_CODE" "$new_code" "$INSTALL_DIR/settings.conf"
-        export GFK_AUTH_CODE="$new_code"
-        stop_gfk_backend
-        start_gfk_backend
-        log_success "GFK Auth Code rotated successfully!"
-        echo -e "  ${GREEN}${BOLD}New Auth Code: ${new_code}${NC}"
+        label="GFK Auth Code"
+        new_secret=$(openssl rand -hex 8 2>/dev/null || od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+        [ -n "$new_secret" ] || { log_error "Could not generate a new auth code"; return 1; }
+        GFK_AUTH_CODE="$new_secret"
+        save_settings || { log_error "Failed to save settings"; return 1; }
+        generate_gfk_config || { log_error "Failed to regenerate GFK config. Roll back with: sudo paqctl restore $(basename "$bk")"; return 1; }
     else
-        local new_key=$("$INSTALL_DIR/bin/paqet" secret 2>/dev/null || openssl rand -base64 32 2>/dev/null | tr -d '=+/' | head -c 32)
-        log_info "Generating new Paqet Encryption Key: $new_key"
-        _safe_update_setting "ENCRYPTION_KEY" "$new_key" "$INSTALL_DIR/settings.conf"
-        export ENCRYPTION_KEY="$new_key"
-        if [ -f "$INSTALL_DIR/config.yaml" ]; then
-            sed -i "s/^key:.*/key: \"$new_key\"/" "$INSTALL_DIR/config.yaml" 2>/dev/null || true
+        label="Paqet Encryption Key"
+        new_secret=$("$INSTALL_DIR/bin/paqet" secret 2>/dev/null || true)
+        [ -n "$new_secret" ] || new_secret=$(openssl rand -hex 32 2>/dev/null || true)
+        [ -n "$new_secret" ] || { log_error "Could not generate a new key"; return 1; }
+        ENCRYPTION_KEY="$new_secret"
+        save_settings || { log_error "Failed to save settings"; return 1; }
+        # config.yaml nests the key under transport.kcp, so regenerate it rather than editing in place
+        _write_paqet_config || { log_error "Failed to update config.yaml. Roll back with: sudo paqctl restore $(basename "$bk")"; return 1; }
+    fi
+
+    if [ "$was_running" = true ]; then
+        if ! restart_paqet; then
+            log_error "The service did not come back up with the new credentials."
+            log_error "Roll back with: sudo paqctl restore $(basename "$bk")"
+            return 1
         fi
-        stop_paqet_backend || true
-        start_paqet_backend || true
-        log_success "Paqet Encryption Key rotated successfully!"
-        echo -e "  ${GREEN}${BOLD}New Encryption Key: ${new_key}${NC}"
+    else
+        log_info "Service is not running; the new credentials apply on next start."
+    fi
+
+    log_success "${label} rotated"
+    echo -e "  ${GREEN}${BOLD}New ${label}: ${new_secret}${NC}"
+    local host uri
+    if host=$(_export_host "") && uri=$(_build_export_uri "$host"); then
+        echo ""
+        echo -e "  ${BOLD}Give every client this new config string:${NC}"
+        echo -e "  ${GREEN}${uri}${NC}"
+        echo -e "  ${DIM}On each client: sudo paqctl import '<string>'${NC}"
     fi
     echo ""
 }
 
+#───────────────────────────────────────────────────────────────────────
+# Cleanup (paqctl's own files only)
+#───────────────────────────────────────────────────────────────────────
 system_cleanup() {
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}  SYSTEM MAINTENANCE & CLEANUP${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    log_info "Cleaning up archived logs and temporary system files..."
-    if command -v journalctl &>/dev/null; then
-        journalctl --vacuum-time=7d 2>/dev/null || true
-        log_success "Systemd journal logs older than 7 days vacuumed."
+    local do_journal=false a
+    for a in "$@"; do
+        case "$a" in
+            --journal) do_journal=true ;;
+            *) log_error "Unknown option for cleanup: $a"; echo "  Usage: paqctl cleanup [--journal]" >&2; return 2 ;;
+        esac
+    done
+    _print_section "PAQCTL CLEANUP"
+
+    # 1. Rotated / archived paqctl logs (the live log files are kept)
+    local f n=0
+    for f in /var/log/paqctl*.gz /var/log/paqctl*.old \
+             /var/log/paqctl.log.[0-9]* /var/log/paqet-backend.log.[0-9]* /var/log/gfk-backend.log.[0-9]*; do
+        [ -f "$f" ] || continue
+        rm -f "$f" && n=$((n + 1))
+    done
+    log_success "Removed $n archived paqctl log file(s)"
+
+    # 2. Leftover temp files from interrupted paqctl operations (older than 1 hour)
+    local t=0
+    t=$(find /tmp -maxdepth 1 \( -name 'paqctl-update-*' -o -name 'paqet-download-*' -o -name 'paqet-update-*' \
+            -o -name 'paqet-extract-*' -o -name '99-paqctl-turbo.conf' -o -name '.tg_curl*' \) -mmin +60 -print 2>/dev/null | wc -l)
+    find /tmp -maxdepth 1 \( -name 'paqctl-update-*' -o -name 'paqet-download-*' -o -name 'paqet-update-*' \
+            -o -name 'paqet-extract-*' -o -name '99-paqctl-turbo.conf' -o -name '.tg_curl*' \) -mmin +60 \
+            -exec rm -rf {} + 2>/dev/null || true
+    local s=0
+    if [ -d "$INSTALL_DIR" ]; then
+        s=$(find "$INSTALL_DIR" "$GFK_DIR" -maxdepth 1 -type f \( -name 'settings.conf.????????' -o -name 'config.yaml.????????' \
+                -o -name 'paqctl.????????' -o -name 'banned_ips.????????' -o -name 'parameters.py.????????' \) -mmin +60 -print 2>/dev/null | wc -l)
+        find "$INSTALL_DIR" "$GFK_DIR" -maxdepth 1 -type f \( -name 'settings.conf.????????' -o -name 'config.yaml.????????' \
+                -o -name 'paqctl.????????' -o -name 'banned_ips.????????' -o -name 'parameters.py.????????' \) -mmin +60 \
+                -delete 2>/dev/null || true
     fi
-    if [ -d "/var/log" ]; then
-        rm -f /var/log/paqctl*.gz /var/log/paqctl*.old 2>/dev/null || true
-        log_success "Old compressed log archives removed."
+    log_success "Removed $((t + s)) stale temp file(s)"
+
+    # 3. Old backups
+    local pruned
+    pruned=$(_prune_backups)
+    log_success "Removed ${pruned:-0} old backup(s) (keeping the newest ${PAQCTL_BACKUP_KEEP})"
+
+    # 4. The systemd journal is shared by every service, so only touch it when asked
+    if [ "$do_journal" != true ] && [ "$MENU_MODE" = true ] && _has_tty && command -v journalctl &>/dev/null; then
+        echo ""
+        echo -e "  ${DIM}The systemd journal holds logs for ALL services on this machine.${NC}"
+        local _ans
+        read -r -p "  Also vacuum journal entries older than 7 days? [y/N]: " _ans < /dev/tty || true
+        [[ "$_ans" =~ ^[Yy]$ ]] && do_journal=true
     fi
-    rm -f /tmp/paqctl* /tmp/.tg_curl* 2>/dev/null || true
-    log_success "Temporary cache and socket files cleaned."
-    
-    if command -v sync &>/dev/null; then
-        sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-        log_success "PageCache, dentries, and inodes freed."
+    if [ "$do_journal" = true ]; then
+        if command -v journalctl &>/dev/null; then
+            journalctl --vacuum-time=7d 2>/dev/null || true
+            log_success "Systemd journal vacuumed (entries older than 7 days, all services)"
+        else
+            log_warn "journalctl not found; skipping journal vacuum"
+        fi
+    elif command -v journalctl &>/dev/null; then
+        echo -e "  ${DIM}Journal not touched (it is system-wide). Use 'paqctl cleanup --journal' to vacuum entries older than 7 days.${NC}"
     fi
+
     echo ""
-    log_success "System cleanup completed!"
+    log_success "Cleanup completed"
     echo ""
 }
 
-export_config_string() {
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}  CONFIG EXPORT / STRING SHARING${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    _load_settings
-    local _ip="${REMOTE_SERVER:-${LOCAL_IP:-$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo 'unknown')}}"
+#───────────────────────────────────────────────────────────────────────
+# Config sharing (export / import)
+#───────────────────────────────────────────────────────────────────────
+_is_private_ipv4() {
+    [[ "$1" =~ ^10\. ]] || [[ "$1" =~ ^192\.168\. ]] || [[ "$1" =~ ^127\. ]] || \
+    [[ "$1" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] || \
+    [[ "$1" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]]
+}
+
+# Address clients should use: explicit override > configured > public lookup
+_export_host() {
+    local override="${1:-}" h=""
+    if [ -n "$override" ]; then
+        echo "$override"
+        return 0
+    fi
+    [ "$BACKEND" = "gfw-knocker" ] && h="${GFK_SERVER_IP:-}"
+    [ -z "$h" ] && h="${REMOTE_SERVER:-${LOCAL_IP:-}}"
+    if [ -z "$h" ]; then
+        log_info "Looking up this server's public IP via api.ipify.org (pass --ip to skip)..." >&2
+        h=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || true)
+        [ -z "$h" ] && h=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    [ -n "$h" ] || return 1
+    echo "$h"
+}
+
+# Build paqet://... or gfk://... for the active backend
+_build_export_uri() {
+    local _ip="$1" raw
     if [ "$BACKEND" = "gfw-knocker" ]; then
-        local raw_str="gfk|${GFK_SERVER_IP:-$_ip}|${GFK_AUTH_CODE}|${GFK_PORT_MAPPINGS:-14000:443}|${GFK_SOCKS_VIO_PORT:-14000}"
-        local b64=$(echo -n "$raw_str" | base64 | tr -d '\r\n')
-        echo -e "  ${BOLD}Shareable GFK Client String:${NC}"
-        echo -e "  ${GREEN}gfk://${b64}${NC}"
-    else
-        local port="${LISTEN_PORT:-8443}"
-        if [[ "$_ip" =~ ^([0-9a-zA-Z\.\-_]+|\[[0-9a-fA-F:]+\]):([0-9]+)$ ]]; then
-            port="${BASH_REMATCH[2]}"
-            _ip="${BASH_REMATCH[1]}"
+        raw="gfk|${_ip}|${GFK_AUTH_CODE}|${GFK_PORT_MAPPINGS:-14000:443}|${GFK_SOCKS_VIO_PORT:-14000}"
+        printf 'gfk://%s\n' "$(printf '%s' "$raw" | base64 | tr -d '\r\n')"
+        return 0
+    fi
+    local port="${LISTEN_PORT:-8443}"
+    if [[ "$_ip" =~ ^([0-9a-zA-Z\.\-_]+|\[[0-9a-fA-F:]+\]):([0-9]+)$ ]]; then
+        port="${BASH_REMATCH[2]}"
+        _ip="${BASH_REMATCH[1]}"
+    fi
+    local key="${ENCRYPTION_KEY:-}"
+    if [ -z "$key" ] && [ -f "$INSTALL_DIR/config.yaml" ]; then
+        key=$(grep -E '^[[:space:]]*key:' "$INSTALL_DIR/config.yaml" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"' || true)
+    fi
+    local _mtu="${KCP_MTU:-}"
+    if [ -z "$_mtu" ] && [ -f "$INSTALL_DIR/config.yaml" ]; then
+        _mtu=$(grep -E '^[[:space:]]*mtu:' "$INSTALL_DIR/config.yaml" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"' || true)
+    fi
+    _mtu="${_mtu:-1350}"
+    raw="paqet|${_ip}|${port}|${key}|${SOCKS_PORT:-1080}|${ROUTING_MODE:-socks5}|${FORWARD_PORT:-14000}|${FORWARD_TARGET:-127.0.0.1:80}|${KCP_PROFILE:-standard}|${_mtu}"
+    printf 'paqet://%s\n' "$(printf '%s' "$raw" | base64 | tr -d '\r\n')"
+}
+
+# export_config_string [--ip ADDR] [--qr]
+export_config_string() {
+    local override="" want_qr=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --ip)
+                [ -n "${2:-}" ] || { log_error "--ip needs an address"; return 2; }
+                override="$2"; shift 2 ;;
+            --ip=*) override="${1#--ip=}"; shift ;;
+            --qr) want_qr=true; shift ;;
+            *) log_error "Unknown option for export: $1"; echo "  Usage: paqctl export [--ip ADDR] [--qr] [--json]" >&2; return 2 ;;
+        esac
+    done
+    if [ -n "$override" ]; then
+        # Bare IPv6 -> [IPv6]
+        if [[ "$override" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$override" == *:*:* ]]; then
+            override="[$override]"
         fi
-        local key="${ENCRYPTION_KEY}"
-        if [ -z "$key" ] && [ -f "$INSTALL_DIR/config.yaml" ]; then
-            key=$(grep -E "^key:" "$INSTALL_DIR/config.yaml" 2>/dev/null | awk '{print $2}' | tr -d '"' || echo "")
+        if ! [[ "$override" =~ ^[A-Za-z0-9.-]+$ ]] && ! [[ "$override" =~ ^\[[0-9a-fA-F:]+\]$ ]]; then
+            log_error "Invalid --ip value: $override (use an IPv4 address, [IPv6] or hostname)"
+            return 2
         fi
-        local _mtu="${KCP_MTU:-}"
-        if [ -z "$_mtu" ] && [ -f "$INSTALL_DIR/config.yaml" ]; then
-            _mtu=$(grep -E "^mtu:" "$INSTALL_DIR/config.yaml" 2>/dev/null | awk '{print $2}' | tr -d '"' || echo "")
+    fi
+
+    _load_settings
+    local host uri
+    if ! host=$(_export_host "$override"); then
+        log_error "Could not determine the server address. Pass it explicitly: paqctl export --ip <address>"
+        return 1
+    fi
+    uri=$(_build_export_uri "$host") || return 1
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        printf '{"backend":%s,"host":%s,"uri":%s}\n' "$(_json_str "$BACKEND")" "$(_json_str "$host")" "$(_json_str "$uri")"
+        return 0
+    fi
+
+    _print_section "CONFIG EXPORT / STRING SHARING"
+    local name="Paqet"
+    [ "$BACKEND" = "gfw-knocker" ] && name="GFK"
+    echo -e "  ${BOLD}Shareable ${name} Client String:${NC}"
+    echo -e "  ${GREEN}${uri}${NC}"
+    echo ""
+    echo -e "  ${YELLOW}⚠ This string contains your encryption key / auth code. Treat it like a password${NC}"
+    echo -e "  ${YELLOW}  and share it only over a private channel.${NC}"
+    local bare="${host%%:*}"
+    if _is_private_ipv4 "$bare"; then
+        echo ""
+        echo -e "  ${YELLOW}!${NC} ${bare} is a private/internal address. Clients outside this network need"
+        echo -e "    the public one: ${BOLD}sudo paqctl export --ip <public-ip>${NC}"
+    fi
+    if [ "$want_qr" = true ]; then
+        echo ""
+        if command -v qrencode &>/dev/null; then
+            qrencode -t ansiutf8 "$uri"
+        else
+            log_warn "qrencode is not installed (apt install qrencode | dnf install qrencode | apk add libqrencode-tools)"
         fi
-        _mtu="${_mtu:-1350}"
-        local raw_str="paqet|${_ip}|${port}|${key}|${SOCKS_PORT:-1080}|${ROUTING_MODE:-socks5}|${FORWARD_PORT:-14000}|${FORWARD_TARGET:-127.0.0.1:80}|${KCP_PROFILE:-standard}|${_mtu}"
-        local b64=$(echo -n "$raw_str" | base64 | tr -d '\r\n')
-        echo -e "  ${BOLD}Shareable Paqet Client String (v2 format):${NC}"
-        echo -e "  ${GREEN}paqet://${b64}${NC}"
+    elif command -v qrencode &>/dev/null; then
+        echo -e "  ${DIM}Tip: 'paqctl export --qr' shows this as a QR code.${NC}"
     fi
     echo ""
-    echo -e "  ${DIM}You can copy this string and use 'Import Config' on client devices.${NC}"
+    echo -e "  ${DIM}On the client: sudo paqctl import '<string>'  (or 'Import Config' in the menu)${NC}"
     echo ""
 }
 
+_valid_hostport() { [[ "$1" =~ ^([A-Za-z0-9.-]+|\[[0-9a-fA-F:]+\]):([0-9]+)$ ]] && _validate_port "${BASH_REMATCH[2]}"; }
+_valid_host() { [[ "$1" =~ ^[A-Za-z0-9.-]+$ ]] || [[ "$1" =~ ^\[[0-9a-fA-F:]+\]$ ]]; }
+
+# import_config_string [STRING | -]
 import_config_string() {
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}  CONFIG IMPORT FROM STRING${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    read -p "  Paste config string (paqet://... or gfk://...): " input_str < /dev/tty || return
-    [ -z "$input_str" ] && return
-    
+    local input_str="${1:-}"
+    _print_section "CONFIG IMPORT FROM STRING"
+    if [ "$input_str" = "-" ]; then
+        IFS= read -r input_str || true
+    elif [ -z "$input_str" ]; then
+        if ! _has_tty; then
+            log_error "No terminal. Usage: paqctl import <string>   or   paqctl import - < file"
+            return 2
+        fi
+        read -r -p "  Paste config string (paqet://... or gfk://...): " input_str < /dev/tty || return 1
+    fi
+    input_str="${input_str//[[:space:]]/}"
+    if [ -z "$input_str" ]; then
+        log_error "Empty config string"
+        return 1
+    fi
+    if [[ "$input_str" != *://* ]]; then
+        log_error "Expected a string starting with paqet:// or gfk://"
+        return 1
+    fi
+
     local proto="${input_str%%://*}"
     local b64="${input_str#*://}"
-    local decoded=$(echo "$b64" | base64 -d 2>/dev/null || echo "$b64" | base64 -D 2>/dev/null || echo "")
-    
+    local decoded
+    decoded=$(printf '%s' "$b64" | base64 -d 2>/dev/null || printf '%s' "$b64" | base64 -D 2>/dev/null || true)
     if [ -z "$decoded" ]; then
         log_error "Invalid or corrupted base64 config string."
         return 1
     fi
-    
+
+    _load_settings
+    if [ "$ROLE" = "server" ]; then
+        log_error "This machine is configured as a server; config strings are imported on clients."
+        echo "  To turn it into a client, run: sudo paqctl config" >&2
+        return 1
+    fi
+
     if [ "$proto" = "paqet" ]; then
-        local _ip _port _key _socks _rmode _fport _ftgt _profile
-        local p1 p2 p3 p4 p5 p6 p7 p8
+        local _p p1 p2 p3 p4 p5 p6 p7 p8 p9
+        local _ip _port _key _socks _rmode _fport _ftgt _profile _mtu
         IFS='|' read -r _p p1 p2 p3 p4 p5 p6 p7 p8 p9 <<< "$decoded"
         if [ "$_p" != "paqet" ] || [ -z "$p1" ] || [ -z "$p2" ]; then
             log_error "Invalid paqet string format."
             return 1
         fi
         if [[ "$p1" =~ ^([0-9a-zA-Z\.\-_]+|\[[0-9a-fA-F:]+\]):([0-9]+)$ ]]; then
-            # 8-part or 9-part combined format: paqet|IP:PORT|KEY|SOCKS|RMODE|FPORT|FTGT|PROF|MTU
-            _ip="${BASH_REMATCH[1]}"
-            _port="${BASH_REMATCH[2]}"
-            _key="$p2"
-            _socks="${p3:-1080}"
-            _rmode="${p4:-socks5}"
-            _fport="${p5:-14000}"
-            _ftgt="${p6:-127.0.0.1:80}"
-            _profile="${p7:-standard}"
-            _mtu="${p8:-1350}"
+            # Combined format: paqet|IP:PORT|KEY|SOCKS|RMODE|FPORT|FTGT|PROF|MTU
+            _ip="${BASH_REMATCH[1]}"; _port="${BASH_REMATCH[2]}"; _key="$p2"
+            _socks="${p3:-1080}"; _rmode="${p4:-socks5}"; _fport="${p5:-14000}"
+            _ftgt="${p6:-127.0.0.1:80}"; _profile="${p7:-standard}"; _mtu="${p8:-1350}"
         else
-            # 9-part or 10-part separate format: paqet|IP|PORT|KEY|SOCKS|RMODE|FPORT|FTGT|PROF|MTU
-            _ip="$p1"
-            _port="$p2"
-            _key="$p3"
-            _socks="${p4:-1080}"
-            _rmode="${p5:-socks5}"
-            _fport="${p6:-14000}"
-            _ftgt="${p7:-127.0.0.1:80}"
-            _profile="${p8:-standard}"
-            _mtu="${p9:-1350}"
+            # Separate format: paqet|IP|PORT|KEY|SOCKS|RMODE|FPORT|FTGT|PROF|MTU
+            _ip="$p1"; _port="$p2"; _key="$p3"
+            _socks="${p4:-1080}"; _rmode="${p5:-socks5}"; _fport="${p6:-14000}"
+            _ftgt="${p7:-127.0.0.1:80}"; _profile="${p8:-standard}"; _mtu="${p9:-1350}"
         fi
+
+        local bad=""
+        _valid_host "$_ip" || bad="server address '$_ip'"
+        [ -z "$bad" ] && ! _validate_port "$_port" && bad="port '$_port'"
+        [ -z "$bad" ] && ! [[ "$_key" =~ ^[A-Za-z0-9+/=_-]{8,128}$ ]] && bad="encryption key"
+        [ -z "$bad" ] && ! _validate_port "$_socks" && bad="SOCKS port '$_socks'"
+        [ -z "$bad" ] && [ "$_rmode" != "socks5" ] && [ "$_rmode" != "forward" ] && bad="routing mode '$_rmode'"
+        [ -z "$bad" ] && ! _validate_port "$_fport" && bad="forward port '$_fport'"
+        [ -z "$bad" ] && ! _valid_hostport "$_ftgt" && bad="forward target '$_ftgt'"
+        [ -z "$bad" ] && ! [[ "$_profile" =~ ^[A-Za-z0-9_-]{1,32}$ ]] && bad="profile '$_profile'"
+        [ -z "$bad" ] && { ! [[ "$_mtu" =~ ^[0-9]+$ ]] || [ "$_mtu" -lt 500 ] || [ "$_mtu" -gt 9000 ]; } && bad="MTU '$_mtu'"
+        if [ -n "$bad" ]; then
+            log_error "Config string has an invalid ${bad}; nothing was changed."
+            return 1
+        fi
+
+        local bk
+        bk=$(backup_config --quiet --label pre-import 2>/dev/null) && log_info "Previous configuration backed up to: $bk"
         log_info "Importing Paqet Client Config (Server: $_ip:$_port)..."
-        _safe_update_setting "REMOTE_SERVER" "$_ip:$_port" "$INSTALL_DIR/settings.conf"
-        _safe_update_setting "LISTEN_PORT" "$_port" "$INSTALL_DIR/settings.conf"
-        _safe_update_setting "ENCRYPTION_KEY" "$_key" "$INSTALL_DIR/settings.conf"
-        [ -n "$_socks" ] && _safe_update_setting "SOCKS_PORT" "$_socks" "$INSTALL_DIR/settings.conf"
-        [ -n "$_rmode" ] && _safe_update_setting "ROUTING_MODE" "$_rmode" "$INSTALL_DIR/settings.conf"
-        [ -n "$_fport" ] && _safe_update_setting "FORWARD_PORT" "$_fport" "$INSTALL_DIR/settings.conf"
-        [ -n "$_ftgt" ] && _safe_update_setting "FORWARD_TARGET" "$_ftgt" "$INSTALL_DIR/settings.conf"
-        [ -n "$_profile" ] && _safe_update_setting "KCP_PROFILE" "$_profile" "$INSTALL_DIR/settings.conf"
-        if [ -n "$_mtu" ]; then
-            local _curr_mtu=$(grep -E "^KCP_MTU=" "$INSTALL_DIR/settings.conf" 2>/dev/null | cut -d'=' -f2 | tr -d '"' || echo "")
-            if [ -n "$_curr_mtu" ] && [ "$_curr_mtu" -gt 0 ] 2>/dev/null && [ "$_curr_mtu" -lt "$_mtu" ] 2>/dev/null; then
-                log_info "Preserving local lower MTU (${_curr_mtu}) over imported server MTU (${_mtu}) to prevent local link overflow."
-                _mtu="$_curr_mtu"
-            fi
-            _safe_update_setting "KCP_MTU" "$_mtu" "$INSTALL_DIR/settings.conf"
+
+        # Keep a lower local MTU so this link never overflows
+        if [[ "${KCP_MTU:-}" =~ ^[0-9]+$ ]] && [ "$KCP_MTU" -gt 0 ] && [ "$KCP_MTU" -lt "$_mtu" ]; then
+            log_info "Preserving local lower MTU (${KCP_MTU}) over imported server MTU (${_mtu}) to prevent local link overflow."
+            _mtu="$KCP_MTU"
         fi
 
         REMOTE_SERVER="$_ip:$_port"; LISTEN_PORT="$_port"; ENCRYPTION_KEY="$_key"
-        [ -n "$_socks" ] && SOCKS_PORT="$_socks"
-        [ -n "$_rmode" ] && ROUTING_MODE="$_rmode"
-        [ -n "$_fport" ] && FORWARD_PORT="$_fport"
-        [ -n "$_ftgt" ] && FORWARD_TARGET="$_ftgt"
-        [ -n "$_profile" ] && KCP_PROFILE="$_profile"
-        [ -n "$_mtu" ] && KCP_MTU="$_mtu"
+        SOCKS_PORT="$_socks"; ROUTING_MODE="$_rmode"; FORWARD_PORT="$_fport"
+        FORWARD_TARGET="$_ftgt"; KCP_PROFILE="$_profile"; KCP_MTU="$_mtu"
 
         if [ -z "$INTERFACE" ] || [ -z "$LOCAL_IP" ] || [ -z "$GATEWAY_MAC" ]; then
             detect_network
-            [ -n "$DETECTED_IFACE" ] && INTERFACE="$DETECTED_IFACE" && _safe_update_setting "INTERFACE" "$INTERFACE" "$INSTALL_DIR/settings.conf"
-            [ -n "$DETECTED_IP" ] && LOCAL_IP="$DETECTED_IP" && _safe_update_setting "LOCAL_IP" "$LOCAL_IP" "$INSTALL_DIR/settings.conf"
-            [ -n "$DETECTED_GW_MAC" ] && GATEWAY_MAC="$DETECTED_GW_MAC" && _safe_update_setting "GATEWAY_MAC" "$GATEWAY_MAC" "$INSTALL_DIR/settings.conf"
+            [ -n "$DETECTED_IFACE" ] && INTERFACE="$DETECTED_IFACE"
+            [ -n "$DETECTED_IP" ] && LOCAL_IP="$DETECTED_IP"
+            [ -n "$DETECTED_GW_MAC" ] && GATEWAY_MAC="$DETECTED_GW_MAC"
         fi
 
-        generate_paqet_yaml "$INSTALL_DIR/config.yaml"
+        save_settings || { log_error "Failed to save settings"; return 1; }
+        _write_paqet_config || return 1
         log_success "Paqet client configuration imported! Restarting service..."
-        stop_paqet_backend || true; start_paqet_backend || true
     elif [ "$proto" = "gfk" ]; then
+        local _p _ip _auth _map _socks
         IFS='|' read -r _p _ip _auth _map _socks <<< "$decoded"
         if [ "$_p" != "gfk" ] || [ -z "$_ip" ] || [ -z "$_auth" ]; then
             log_error "Invalid gfk string format."
             return 1
         fi
+        local bad=""
+        _valid_host "$_ip" || bad="server address '$_ip'"
+        [ -z "$bad" ] && ! [[ "$_auth" =~ ^[A-Za-z0-9_-]{4,128}$ ]] && bad="auth code"
+        [ -z "$bad" ] && [ -n "$_map" ] && ! [[ "$_map" =~ ^[0-9]+:[0-9]+(,[0-9]+:[0-9]+)*$ ]] && bad="port mappings '$_map'"
+        [ -z "$bad" ] && [ -n "$_socks" ] && ! _validate_port "$_socks" && bad="SOCKS port '$_socks'"
+        if [ -n "$bad" ]; then
+            log_error "Config string has an invalid ${bad}; nothing was changed."
+            return 1
+        fi
+
+        local bk
+        bk=$(backup_config --quiet --label pre-import 2>/dev/null) && log_info "Previous configuration backed up to: $bk"
         log_info "Importing GFK Client Config (Server: $_ip)..."
-        _safe_update_setting "GFK_SERVER_IP" "$_ip" "$INSTALL_DIR/settings.conf"
-        _safe_update_setting "GFK_AUTH_CODE" "$_auth" "$INSTALL_DIR/settings.conf"
-        [ -n "$_map" ] && _safe_update_setting "GFK_PORT_MAPPINGS" "$_map" "$INSTALL_DIR/settings.conf"
-        [ -n "$_socks" ] && _safe_update_setting "GFK_SOCKS_VIO_PORT" "$_socks" "$INSTALL_DIR/settings.conf"
-        _load_settings
+        GFK_SERVER_IP="$_ip"; GFK_AUTH_CODE="$_auth"
+        [ -n "$_map" ] && GFK_PORT_MAPPINGS="$_map"
+        [ -n "$_socks" ] && GFK_SOCKS_VIO_PORT="$_socks"
+        save_settings || { log_error "Failed to save settings"; return 1; }
         generate_gfk_config 2>/dev/null || true
         log_success "GFK client configuration imported! Restarting service..."
-        stop_gfk_backend || true; start_gfk_backend || true
     else
         log_error "Unknown protocol prefix: $proto (expected paqet:// or gfk://)"
         return 1
     fi
+
+    local rc=0
+    if is_running; then
+        restart_paqet || rc=1
+    else
+        start_paqet || rc=1
+    fi
     echo ""
+    return $rc
 }
 
 #═══════════════════════════════════════════════════════════════════════
@@ -7443,18 +8366,21 @@ uninstall_paqctl() {
     fi
     echo "  - All configuration files"
     echo "  - Systemd services"
-    echo "  - Firewall rules"
-    echo "  - Telegram service"
+    echo "  - Firewall rules (including IP bans)"
+    echo "  - Telegram service, watchdog and shell completion"
+    echo "  - Backups in $BACKUP_DIR"
     echo ""
-    read -p "  Are you sure? [y/N]: " confirm < /dev/tty || true
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    if ! _confirm "Are you sure?"; then
         log_info "Cancelled"
-        return 0
+        return 1
     fi
 
     # Stop services
     stop_paqet
     stop_telegram_service
+    manage_watchdog disable &>/dev/null || true
+    rm -f /usr/share/bash-completion/completions/paqctl /etc/bash_completion.d/paqctl \
+          /usr/share/zsh/site-functions/_paqctl /usr/local/share/zsh/site-functions/_paqctl 2>/dev/null || true
 
     # Stop standalone GFK xray and clean up config
     pkill -f "xray run -c.*gfk-socks.json" 2>/dev/null || true
@@ -7516,48 +8442,695 @@ except: pass
 # Help
 #═══════════════════════════════════════════════════════════════════════
 
+#───────────────────────────────────────────────────────────────────────
+# Command registry: the single source for help, aliases, suggestions
+# and shell completion.   name;aliases;usage;group;summary
+#───────────────────────────────────────────────────────────────────────
+_PAQCTL_COMMANDS=(
+"menu;;menu;General;Interactive menu (default when no command is given)"
+"status;;status [--json];General;Show service status and configuration"
+"info;details client;info [--ip ADDR] [--qr] [--json];General;Show connection info and the shareable client string"
+"help;--help -h;help [COMMAND];General;Show help, or detailed help for one command"
+"version;--version;version;General;Show version info"
+"completion;;completion [bash|zsh];General;Print a shell completion script"
+"start;;start;Service;Start the active backend(s)"
+"stop;;stop;Service;Stop the active backend(s)"
+"restart;;restart;Service;Restart the active backend(s)"
+"start-paqet;;start-paqet;Service;Start only the paqet backend"
+"stop-paqet;;stop-paqet;Service;Stop only the paqet backend"
+"start-gfk;;start-gfk;Service;Start only the GFK backend"
+"stop-gfk;;stop-gfk;Service;Stop only the GFK backend"
+"start-all;;start-all;Service;Start every installed backend"
+"stop-all;;stop-all;Service;Stop every installed backend"
+"enable;boot-enable;enable;Service;Enable auto-start on boot (systemd, OpenRC, SysVinit)"
+"disable;boot-disable;disable;Service;Disable auto-start on boot"
+"watchdog;;watchdog [enable|disable|status];Service;Self-healing watchdog that restarts a failed service"
+"health;;health [--json];Diagnostics;Run health checks (exits 1 if any check fails)"
+"doctor;;doctor [--fix] [--json];Diagnostics;Health checks plus suggested fixes; --fix applies the safe ones"
+"test;;test [--url URL];Diagnostics;End-to-end request through the local proxy (run on a client)"
+"logs;;logs [-n N] [--no-follow] [--since TIME] [--backend paqet|gfk] [--errors];Diagnostics;View service logs"
+"ping;;ping;Diagnostics;Test connectivity with paqet ping"
+"dump;;dump;Diagnostics;Capture packets for diagnostics (paqet dump)"
+"monitor;top clients;monitor;Diagnostics;Active client monitor"
+"speedtest;speed;speedtest;Diagnostics;Server speed and bandwidth test"
+"routing;dns check-dns;routing;Diagnostics;DNS leak and proxy routing check"
+"config;;config [show [--reveal] | edit | set KEY=VALUE...];Configuration;Change configuration (interactive with no arguments)"
+"export;share;export [--ip ADDR] [--qr] [--json];Configuration;Print the shareable client config string"
+"import;;import [STRING | -];Configuration;Import a paqet:// or gfk:// string ('-' reads stdin)"
+"rotate-key;rotate;rotate-key;Configuration;Rotate the encryption key / auth code and restart"
+"secret;;secret;Configuration;Generate a new encryption key (prints it, does not apply it)"
+"tune;tuning;tune;Configuration;Performance and KCP profile tuning menu"
+"turbo;;turbo;Configuration;Enable kernel turbo mode (BBR, larger socket buffers)"
+"turbo-off;;turbo-off;Configuration;Disable kernel turbo mode"
+"telegram;;telegram;Configuration;Telegram notification settings"
+"firewall;;firewall;Security;Show and manage paqctl's firewall rules"
+"ban;;ban <IP[/CIDR]> | ban list;Security;Block an IP or range (IPv4/IPv6, survives restarts)"
+"unban;;unban <IP[/CIDR]>;Security;Remove a ban"
+"backup;;backup;Maintenance;Back up configuration (keeps the newest 10)"
+"restore;;restore [FILE | latest | N];Maintenance;Restore configuration from a backup"
+"update;;update;Maintenance;Update the backend binary and the management script"
+"self-update;;self-update;Maintenance;Update only the paqctl management script"
+"rollback;;rollback;Maintenance;Roll back to a previous paqet version"
+"cleanup;clean;cleanup [--journal];Maintenance;Remove paqctl's old logs, temp files and backups"
+"uninstall;;uninstall;Maintenance;Remove paqctl completely"
+)
+_PAQCTL_GROUPS=(General Service Diagnostics Configuration Security Maintenance)
+
+# Canonical command name for a name or alias
+_resolve_command() {
+    local input="$1" entry name aliases a
+    [ -n "$input" ] || return 1
+    for entry in "${_PAQCTL_COMMANDS[@]}"; do
+        IFS=';' read -r name aliases _ <<< "$entry"
+        [ "$input" = "$name" ] && { echo "$name"; return 0; }
+        for a in $aliases; do
+            [ "$input" = "$a" ] && { echo "$name"; return 0; }
+        done
+    done
+    return 1
+}
+
+_command_entry() {
+    local want="$1" entry name
+    for entry in "${_PAQCTL_COMMANDS[@]}"; do
+        IFS=';' read -r name _ <<< "$entry"
+        [ "$name" = "$want" ] && { echo "$entry"; return 0; }
+    done
+    return 1
+}
+
+# Every name and alias (used by completion)
+_command_words() {
+    local entry name aliases
+    for entry in "${_PAQCTL_COMMANDS[@]}"; do
+        IFS=';' read -r name aliases _ <<< "$entry"
+        echo "$name"
+        local a
+        for a in $aliases; do
+            [[ "$a" == -* ]] || echo "$a"
+        done
+    done
+}
+
+_command_names() {
+    local entry name
+    for entry in "${_PAQCTL_COMMANDS[@]}"; do
+        IFS=';' read -r name _ <<< "$entry"
+        echo "$name"
+    done
+}
+
+_levenshtein() {
+    local a="$1" b="$2" i j cost la=${#1} lb=${#2} del ins sub m
+    local -a prev cur
+    for ((j = 0; j <= lb; j++)); do prev[j]=$j; done
+    for ((i = 1; i <= la; i++)); do
+        cur=([0]=$i)
+        for ((j = 1; j <= lb; j++)); do
+            if [ "${a:i-1:1}" = "${b:j-1:1}" ]; then cost=0; else cost=1; fi
+            del=$((prev[j] + 1)); ins=$((cur[j-1] + 1)); sub=$((prev[j-1] + cost))
+            m=$del
+            [ "$ins" -lt "$m" ] && m=$ins
+            [ "$sub" -lt "$m" ] && m=$sub
+            cur[j]=$m
+        done
+        prev=("${cur[@]}")
+    done
+    echo "${prev[lb]}"
+}
+
+# Closest command to a typo (prefix match first, then edit distance <= 2)
+_suggest_command() {
+    local input="$1" w best="" best_d=99 d
+    [ -n "$input" ] || return 1
+    local -a prefix_hits=()
+    while IFS= read -r w; do
+        [[ "$w" == "$input"* ]] && prefix_hits+=("$w")
+    done < <(_command_words)
+    if [ ${#prefix_hits[@]} -eq 1 ]; then
+        _resolve_command "${prefix_hits[0]}"
+        return 0
+    fi
+    while IFS= read -r w; do
+        d=$(_levenshtein "$input" "$w")
+        if [ "$d" -lt "$best_d" ]; then best_d=$d; best=$w; fi
+    done < <(_command_words)
+    if [ -n "$best" ] && [ "$best_d" -le 2 ] && [ "$best_d" -lt ${#input} ]; then
+        _resolve_command "$best"
+        return 0
+    fi
+    return 1
+}
+
+# Longer help text and examples for 'paqctl help <command>'
+_command_details() {
+    case "$1" in
+        status)  echo "  Exit code is 0 whether or not the service runs; use --json and read \"running\"." ;;
+        logs)    cat << 'EOF'
+  Options:
+    -n, --lines N      Number of lines to show (default 50)
+    --no-follow        Print and exit (default when output is not a terminal)
+    -f, --follow       Keep following new lines
+    --since TIME       Only entries since TIME (systemd journal only), e.g. "1 hour ago"
+    --backend NAME     paqet or gfk: read that backend's own log file if it has one
+    --errors           Only lines that look like errors or warnings
+  Examples:
+    paqctl logs -n 200 --no-follow --errors
+    paqctl logs --since "30 min ago"
+EOF
+            ;;
+        health)  echo "  Exit code: 0 when every check passes, 1 when any check fails." ;;
+        doctor)  cat << 'EOF'
+  Runs the health checks plus extra ones (interface/IP/gateway drift, MTU,
+  port conflicts, config/settings mismatch, disk, DNS) and prints a fix for
+  each problem. --fix applies the safe fixes: re-adding firewall rules,
+  regenerating config.yaml from settings.conf, starting the service and
+  enabling auto-start. Exit code is 1 while any check still fails.
+EOF
+            ;;
+        test)    cat << 'EOF'
+  On a client, fetches a URL through the local SOCKS5 proxy and reports the
+  exit IP, location, HTTP status and timing. Warns when the exit IP equals
+  this machine's direct IP. In forward mode it checks the forward port.
+  Default URL: https://www.cloudflare.com/cdn-cgi/trace
+EOF
+            ;;
+        config)  cat << 'EOF'
+  config                 Interactive wizard (needs a terminal)
+  config show [--reveal] Print settings.conf (secrets masked unless --reveal; --json supported)
+  config edit            Open config.yaml (or GFK parameters.py) in $EDITOR, validate, restart
+  config set KEY=VALUE   Change settings, regenerate config and restart if running
+  Settable keys:
+    LISTEN_PORT SOCKS_PORT FORWARD_PORT REMOTE_SERVER FORWARD_TARGET INTERFACE
+    LOCAL_IP GATEWAY_MAC ENCRYPTION_KEY PAQET_TCP_LOCAL_FLAG PAQET_TCP_REMOTE_FLAG
+    ROUTING_MODE KCP_MTU KCP_CONN KCP_SNDWND KCP_RCVWND GFK_SERVER_IP GFK_AUTH_CODE
+    TELEGRAM_SERVER_LABEL
+  Examples:
+    paqctl config set LISTEN_PORT=9443
+    paqctl config set KCP_MTU=1200 SOCKS_PORT=1081
+EOF
+            ;;
+        export)  cat << 'EOF'
+  The string contains your encryption key / auth code: share it privately.
+  --ip ADDR   Address clients should use (default: configured IP; looks up the
+              public IP via api.ipify.org only if nothing is configured)
+  --qr        Also print a QR code (needs qrencode)
+EOF
+            ;;
+        import)  cat << 'EOF'
+  paqctl import 'paqet://...'     Import from an argument
+  paqctl import - < string.txt    Read the string from stdin
+  paqctl import                   Prompt for it
+  The current configuration is backed up first; every field is validated.
+EOF
+            ;;
+        rotate-key) echo "  Backs up the current config, generates a new secret, restarts the service and prints the new client string. Use -y to skip the confirmation." ;;
+        ban)     cat << 'EOF'
+  Bans are tagged "paqctl-ban", recorded in /opt/paqctl/banned_ips and
+  re-applied whenever the service starts, so they survive restarts and reboots.
+  Examples:
+    paqctl ban 203.0.113.7
+    paqctl ban 198.51.100.0/24
+    paqctl ban 2001:db8::/32
+    paqctl ban list            (add --json for machine-readable output)
+EOF
+            ;;
+        restore) echo "  'latest' picks the newest backup, N picks the Nth newest. The current config is backed up first." ;;
+        cleanup) echo "  Removes archived paqctl logs, stale temp files and old backups. --journal also vacuums the system-wide journal (all services) to 7 days." ;;
+        watchdog) echo "  With no argument shows status. 'watchdog check' is what the timer runs; it skips if another paqctl command is in progress." ;;
+        update)  echo "  Updates the paqet binary (or GFK scripts) and then the management script. Use -y to update without prompting." ;;
+        completion) cat << 'EOF'
+  bash:  paqctl completion bash | sudo tee /etc/bash_completion.d/paqctl
+  zsh:   paqctl completion zsh  > "${fpath[1]}/_paqctl"
+  (The installer sets up bash completion automatically.)
+EOF
+            ;;
+    esac
+}
+
 show_help() {
+    local topic="${1:-}"
+    if [ -n "$topic" ]; then
+        _show_command_help "$topic"
+        return
+    fi
     echo ""
     echo -e "${BOLD}paqctl${NC} - Paqet Manager v${VERSION}"
     echo ""
-    echo -e "${BOLD}Usage:${NC} sudo paqctl <command>"
+    echo -e "${BOLD}Usage:${NC} sudo paqctl <command> [options]"
     echo ""
-    echo -e "${BOLD}Commands:${NC}"
-    echo "  menu        Interactive menu (default)"
-    echo "  status      Show service status and configuration"
+    local group entry name aliases usage g summary
+    for group in "${_PAQCTL_GROUPS[@]}"; do
+        echo -e "${BOLD}${group}:${NC}"
+        for entry in "${_PAQCTL_COMMANDS[@]}"; do
+            IFS=';' read -r name aliases usage g summary <<< "$entry"
+            [ "$g" = "$group" ] || continue
+            printf "  %-13s %s\n" "$name" "$summary"
+        done
+        echo ""
+    done
+    echo -e "${BOLD}Global options:${NC}"
+    echo "  -y, --yes     Answer yes to confirmation prompts (for scripts)"
+    echo "  --json        Machine-readable output (status, info, health, doctor, export, config show, ban list)"
+    echo "  --no-color    Disable colours (also NO_COLOR=1, or when output is not a terminal)"
     echo ""
-    echo -e "${BOLD}Backend Control (individual):${NC}"
-    echo "  start-paqet   Start paqet backend only"
-    echo "  stop-paqet    Stop paqet backend only"
-    echo "  start-gfk     Start GFK backend only"
-    echo "  stop-gfk      Stop GFK backend only"
-    echo "  start-all     Start both backends"
-    echo "  stop-all      Stop both backends"
-    echo ""
-    echo -e "${BOLD}Legacy (uses active backend):${NC}"
-    echo "  start       Start active backend"
-    echo "  stop        Stop active backend"
-    echo "  restart     Restart active backend"
-    echo ""
-    echo -e "${BOLD}Other:${NC}"
-    echo "  logs        View logs (live)"
-    echo "  health      Run health check diagnostics"
-    echo "  update      Check for and install updates"
-    echo "  config      Change configuration"
-    echo "  secret      Generate a new encryption key"
-    echo "  firewall    Manage iptables rules"
-    echo "  backup      Backup configuration"
-    echo "  restore     Restore from backup"
-    echo "  telegram    Telegram notification settings"
-    echo "  rollback    Roll back to a previous paqet version"
-    echo "  ping        Test connectivity (paqet ping)"
-    echo "  dump        Capture packets for diagnostics (paqet dump)"
-    echo "  uninstall   Remove paqctl completely"
-    echo "  version     Show version info"
-    echo "  help        Show this help"
+    echo "Run 'paqctl help <command>' for options, aliases and examples."
     echo ""
     echo -e "${BOLD}Paqet:${NC} https://github.com/SamNet-dev/paqctl"
     echo ""
+}
+
+_show_command_help() {
+    local cmd entry name aliases usage group summary
+    if ! cmd=$(_resolve_command "$1"); then
+        echo -e "${RED}Unknown command: $1${NC}" >&2
+        local guess
+        guess=$(_suggest_command "$1") && echo -e "Did you mean: ${BOLD}paqctl help ${guess}${NC} ?" >&2
+        return 2
+    fi
+    entry=$(_command_entry "$cmd")
+    IFS=';' read -r name aliases usage group summary <<< "$entry"
+    echo ""
+    echo -e "${BOLD}paqctl ${name}${NC} - ${summary}"
+    echo ""
+    echo -e "${BOLD}Usage:${NC} sudo paqctl ${usage}"
+    [ -n "$aliases" ] && echo -e "${BOLD}Aliases:${NC} ${aliases}"
+    local details
+    details=$(_command_details "$name")
+    if [ -n "$details" ]; then
+        echo ""
+        echo "$details"
+    fi
+    echo ""
+}
+
+_completion_bash() {
+    local words names
+    words=$(_command_words | tr '\n' ' ')
+    names=$(_command_names | tr '\n' ' ')
+    cat << EOF
+# bash completion for paqctl (generated by paqctl ${VERSION})
+_paqctl() {
+    local cur prev sub i
+    cur="\${COMP_WORDS[COMP_CWORD]}"
+    prev="\${COMP_WORDS[COMP_CWORD-1]}"
+    sub=""
+    for ((i = 1; i < COMP_CWORD; i++)); do
+        case "\${COMP_WORDS[i]}" in
+            -y|--yes|--json|--no-color) ;;
+            *) sub="\${COMP_WORDS[i]}"; break ;;
+        esac
+    done
+    if [ -z "\$sub" ]; then
+        COMPREPLY=( \$(compgen -W "${words}-y --yes --json --no-color" -- "\$cur") )
+        return 0
+    fi
+    case "\$sub" in
+        help) COMPREPLY=( \$(compgen -W "${names}" -- "\$cur") ) ;;
+        watchdog) COMPREPLY=( \$(compgen -W "enable disable status" -- "\$cur") ) ;;
+        logs)
+            case "\$prev" in
+                --backend) COMPREPLY=( \$(compgen -W "paqet gfk" -- "\$cur") ) ;;
+                -n|--lines|--since) COMPREPLY=() ;;
+                *) COMPREPLY=( \$(compgen -W "-n --no-follow --follow --since --backend --errors" -- "\$cur") ) ;;
+            esac ;;
+        config)
+            if [ "\$prev" = "set" ] || [[ "\$cur" == *=* ]]; then
+                COMPREPLY=( \$(compgen -W "LISTEN_PORT= SOCKS_PORT= FORWARD_PORT= REMOTE_SERVER= FORWARD_TARGET= INTERFACE= LOCAL_IP= GATEWAY_MAC= ENCRYPTION_KEY= PAQET_TCP_LOCAL_FLAG= PAQET_TCP_REMOTE_FLAG= ROUTING_MODE= KCP_MTU= KCP_CONN= KCP_SNDWND= KCP_RCVWND= GFK_SERVER_IP= GFK_AUTH_CODE= TELEGRAM_SERVER_LABEL=" -- "\$cur") )
+                compopt -o nospace 2>/dev/null
+            else
+                COMPREPLY=( \$(compgen -W "show edit set --reveal" -- "\$cur") )
+            fi ;;
+        ban) COMPREPLY=( \$(compgen -W "list" -- "\$cur") ) ;;
+        restore) COMPREPLY=( \$(compgen -W "latest" -- "\$cur") \$(compgen -f -- "\$cur") ) ;;
+        export|share|info|details|client)
+            COMPREPLY=( \$(compgen -W "--ip --qr --json" -- "\$cur") ) ;;
+        status|health) COMPREPLY=( \$(compgen -W "--json" -- "\$cur") ) ;;
+        doctor) COMPREPLY=( \$(compgen -W "--fix --json" -- "\$cur") ) ;;
+        cleanup|clean) COMPREPLY=( \$(compgen -W "--journal" -- "\$cur") ) ;;
+        test) COMPREPLY=( \$(compgen -W "--url" -- "\$cur") ) ;;
+        completion) COMPREPLY=( \$(compgen -W "bash zsh" -- "\$cur") ) ;;
+        *) COMPREPLY=() ;;
+    esac
+}
+complete -F _paqctl paqctl
+EOF
+}
+
+show_completion() {
+    case "${1:-bash}" in
+        bash) _completion_bash ;;
+        zsh)
+            echo "#compdef paqctl"
+            echo "autoload -U +X bashcompinit && bashcompinit"
+            _completion_bash
+            ;;
+        *) log_error "Unsupported shell: $1 (use bash or zsh)"; return 2 ;;
+    esac
+}
+
+#───────────────────────────────────────────────────────────────────────
+# config show / edit / set
+#───────────────────────────────────────────────────────────────────────
+_SECRET_KEYS=" ENCRYPTION_KEY GFK_AUTH_CODE TELEGRAM_BOT_TOKEN "
+_CONFIG_SET_KEYS="LISTEN_PORT SOCKS_PORT FORWARD_PORT REMOTE_SERVER FORWARD_TARGET INTERFACE LOCAL_IP GATEWAY_MAC ENCRYPTION_KEY PAQET_TCP_LOCAL_FLAG PAQET_TCP_REMOTE_FLAG ROUTING_MODE KCP_MTU KCP_CONN KCP_SNDWND KCP_RCVWND GFK_SERVER_IP GFK_AUTH_CODE TELEGRAM_SERVER_LABEL"
+
+_mask_secret() {
+    local s="$1"
+    if [ ${#s} -le 8 ]; then printf '****'; else printf '%s****%s' "${s:0:4}" "${s: -2}"; fi
+}
+
+config_command() {
+    case "${1:-}" in
+        "")   change_config ;;
+        show) shift; config_show "$@" ;;
+        edit) shift; config_edit "$@" ;;
+        set)  shift; config_set "$@" ;;
+        *)
+            log_error "Unknown config subcommand: $1"
+            echo "  Usage: paqctl config [show [--reveal] | edit | set KEY=VALUE...]" >&2
+            return 2
+            ;;
+    esac
+}
+
+config_show() {
+    local reveal=false a
+    for a in "$@"; do
+        case "$a" in
+            --reveal) reveal=true ;;
+            *) log_error "Unknown option for config show: $a"; return 2 ;;
+        esac
+    done
+    if [ ! -r "$INSTALL_DIR/settings.conf" ]; then
+        log_error "No settings found at $INSTALL_DIR/settings.conf"
+        return 1
+    fi
+    local k v first=true
+    if [ "$JSON_OUTPUT" = true ]; then
+        printf '{'
+    else
+        _print_section "CONFIGURATION (settings.conf)"
+    fi
+    while IFS='=' read -r k v; do
+        [[ "$k" =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue
+        v="${v#\"}"; v="${v%\"}"
+        if [[ "$_SECRET_KEYS" == *" $k "* ]] && [ "$reveal" != true ] && [ -n "$v" ]; then
+            v=$(_mask_secret "$v")
+        fi
+        if [ "$JSON_OUTPUT" = true ]; then
+            [ "$first" = true ] || printf ','
+            first=false
+            printf '%s:%s' "$(_json_str "$k")" "$(_json_str "$v")"
+        else
+            printf "  %-26s %s\n" "$k" "$v"
+        fi
+    done < "$INSTALL_DIR/settings.conf"
+    if [ "$JSON_OUTPUT" = true ]; then
+        printf '}\n'
+    else
+        echo ""
+        [ "$reveal" = true ] || echo -e "  ${DIM}Secrets are masked; add --reveal to show them.${NC}"
+        echo -e "  ${DIM}Change values with: sudo paqctl config set KEY=VALUE${NC}"
+        echo ""
+    fi
+}
+
+# _config_validate KEY VALUE -> 0 valid, 1 invalid, 3 unknown key
+_config_validate() {
+    local k="$1" v="$2"
+    case "$k" in
+        LISTEN_PORT|SOCKS_PORT|FORWARD_PORT) _validate_port "$v" ;;
+        REMOTE_SERVER|FORWARD_TARGET) _valid_hostport "$v" ;;
+        INTERFACE) _validate_iface "$v" ;;
+        LOCAL_IP) _validate_ip "$v" ;;
+        GATEWAY_MAC) _validate_mac "$v" ;;
+        ENCRYPTION_KEY) [[ "$v" =~ ^[A-Za-z0-9+/=_-]{8,128}$ ]] ;;
+        PAQET_TCP_LOCAL_FLAG|PAQET_TCP_REMOTE_FLAG) [[ "$v" =~ ^[FSRPAUEC]+(,[FSRPAUEC]+)*$ ]] ;;
+        ROUTING_MODE) [ "$v" = "socks5" ] || [ "$v" = "forward" ] ;;
+        KCP_MTU) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 500 ] && [ "$v" -le 9000 ] ;;
+        KCP_CONN) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 64 ] ;;
+        KCP_SNDWND|KCP_RCVWND) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 16 ] && [ "$v" -le 65535 ] ;;
+        GFK_SERVER_IP) _validate_ip "$v" || [[ "$v" =~ ^[A-Za-z0-9.-]+$ ]] ;;
+        GFK_AUTH_CODE) [[ "$v" =~ ^[A-Za-z0-9_-]{4,128}$ ]] ;;
+        TELEGRAM_SERVER_LABEL) [[ "$v" =~ ^[A-Za-z0-9\ ._-]{1,64}$ ]] ;;
+        *) return 3 ;;
+    esac
+}
+
+config_set() {
+    if [ $# -eq 0 ]; then
+        log_error "Usage: paqctl config set KEY=VALUE [KEY=VALUE...]   (see: paqctl help config)"
+        return 2
+    fi
+    local -a keys=() vals=()
+    local pair k v rc
+    for pair in "$@"; do
+        if [[ "$pair" != *=* ]]; then
+            log_error "Expected KEY=VALUE, got: $pair"
+            return 2
+        fi
+        k="${pair%%=*}"; v="${pair#*=}"
+        k="${k^^}"
+        rc=0
+        _config_validate "$k" "$v" || rc=$?
+        if [ "$rc" -eq 3 ]; then
+            log_error "Unknown or read-only setting: $k"
+            echo "  Settable keys: $_CONFIG_SET_KEYS" >&2
+            return 2
+        elif [ "$rc" -ne 0 ]; then
+            log_error "Invalid value for $k: $v"
+            return 2
+        fi
+        keys+=("$k"); vals+=("$v")
+    done
+
+    local needs_restart=false touches_paqet=false touches_gfk=false i
+    for k in "${keys[@]}"; do
+        case "$k" in
+            TELEGRAM_SERVER_LABEL) ;;
+            GFK_*) touches_gfk=true; needs_restart=true ;;
+            *) touches_paqet=true; needs_restart=true ;;
+        esac
+    done
+
+    local bk
+    bk=$(backup_config --quiet --label pre-config 2>/dev/null) && log_info "Previous configuration backed up to: $bk"
+
+    local was_running=false
+    if [ "$needs_restart" = true ] && is_running; then
+        was_running=true
+        # Stop first so firewall rules for the old port are removed
+        stop_paqet
+    fi
+
+    local old shown_old shown_new
+    for ((i = 0; i < ${#keys[@]}; i++)); do
+        k="${keys[$i]}"; v="${vals[$i]}"
+        old="${!k:-}"
+        printf -v "$k" '%s' "$v"
+        shown_old="$old"; shown_new="$v"
+        if [[ "$_SECRET_KEYS" == *" $k "* ]]; then
+            shown_old=$(_mask_secret "$old"); shown_new=$(_mask_secret "$v")
+        fi
+        log_info "${k}: ${shown_old:-<empty>} → ${shown_new}"
+    done
+
+    local result=0
+    if ! save_settings; then
+        log_error "Failed to save settings"
+        result=1
+    fi
+    if [ "$result" -eq 0 ] && [ "$touches_paqet" = true ] && _paqet_installed; then
+        _write_paqet_config || result=1
+    fi
+    if [ "$result" -eq 0 ] && [ "$touches_gfk" = true ] && _gfk_installed; then
+        generate_gfk_config || result=1
+    fi
+    [ "$result" -eq 0 ] && log_success "Configuration updated"
+
+    if [ "$was_running" = true ]; then
+        start_paqet || result=1
+    elif [ "$needs_restart" = true ]; then
+        log_info "Service is not running; changes apply on next start."
+    fi
+    return $result
+}
+
+config_edit() {
+    local file kind
+    if [ "$BACKEND" = "gfw-knocker" ]; then
+        file="$GFK_DIR/parameters.py"; kind="python"
+    else
+        file="$INSTALL_DIR/config.yaml"; kind="yaml"
+    fi
+    if [ ! -f "$file" ]; then
+        log_error "$file does not exist. Create it with: sudo paqctl config"
+        return 1
+    fi
+    if ! _has_tty; then
+        log_error "config edit needs a terminal. Use 'paqctl config set KEY=VALUE' in scripts."
+        return 1
+    fi
+    local editor="${VISUAL:-${EDITOR:-}}" e
+    if [ -z "$editor" ]; then
+        for e in nano vim vi; do
+            command -v "$e" &>/dev/null && { editor="$e"; break; }
+        done
+    fi
+    [ -n "$editor" ] || { log_error "No editor found. Set EDITOR, e.g.: sudo EDITOR=nano paqctl config edit"; return 1; }
+
+    local tmp
+    tmp=$(mktemp "${file}.XXXXXXXX") || { log_error "Failed to create temp file"; return 1; }
+    chmod 600 "$tmp"
+    cp -p "$file" "$tmp"
+    # shellcheck disable=SC2086
+    $editor "$tmp" < /dev/tty > /dev/tty
+    if cmp -s "$file" "$tmp"; then
+        rm -f "$tmp"
+        log_info "No changes made"
+        return 0
+    fi
+
+    local valid=true
+    if [ "$kind" = "yaml" ]; then
+        if command -v python3 &>/dev/null && python3 -c 'import yaml' 2>/dev/null; then
+            python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$tmp" 2>/dev/null || valid=false
+        fi
+        grep -qE '^role:[[:space:]]*"?(server|client)"?' "$tmp" || valid=false
+    else
+        if command -v python3 &>/dev/null; then
+            python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$tmp" 2>/dev/null || valid=false
+        fi
+    fi
+    if [ "$valid" != true ]; then
+        log_error "The edited file does not look valid; nothing was changed."
+        log_error "Your edited copy is kept at: $tmp"
+        return 1
+    fi
+
+    local bk
+    bk=$(backup_config --quiet --label pre-edit 2>/dev/null) && log_info "Previous configuration backed up to: $bk"
+    mv -f "$tmp" "$file" && chmod 600 "$file"
+    log_success "Saved $file"
+    echo -e "  ${DIM}Note: 'config', 'config set', 'tune', 'import' and 'rotate-key' regenerate this file from settings.conf and overwrite manual edits.${NC}"
+    if is_running && _confirm "Restart now to apply the changes?"; then
+        restart_paqet
+    fi
+}
+
+#───────────────────────────────────────────────────────────────────────
+# End-to-end test through the tunnel (client side)
+#───────────────────────────────────────────────────────────────────────
+run_e2e_test() {
+    local url="https://www.cloudflare.com/cdn-cgi/trace"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --url) [ -n "${2:-}" ] || { log_error "--url needs a value"; return 2; }; url="$2"; shift 2 ;;
+            --url=*) url="${1#--url=}"; shift ;;
+            *) log_error "Unknown option for test: $1"; echo "  Usage: paqctl test [--url URL]" >&2; return 2 ;;
+        esac
+    done
+    [[ "$url" =~ ^https?:// ]] || { log_error "URL must start with http:// or https://"; return 2; }
+    command -v curl &>/dev/null || { log_error "curl is required"; return 1; }
+    _print_section "END-TO-END TEST"
+
+    if [ "$ROLE" = "server" ]; then
+        log_info "This machine is a server; run 'paqctl test' on a client to test the tunnel."
+        log_info "Checking this server's own outbound connectivity instead..."
+        local direct pub_ip
+        if direct=$(curl -s --max-time 10 "$url"); then
+            pub_ip=$(echo "$direct" | sed -n 's/^ip=//p' | head -1)
+            log_success "Outbound HTTPS works${pub_ip:+ (public IP: $pub_ip)}"
+            return 0
+        fi
+        log_error "Could not reach $url from this server"
+        return 1
+    fi
+
+    if ! is_running; then
+        log_error "paqctl is not running. Start it with: sudo paqctl start"
+        return 1
+    fi
+
+    local port
+    if [ "$BACKEND" = "gfw-knocker" ]; then
+        port=$(_gfk_client_socks_port)
+    elif [ "${ROUTING_MODE:-socks5}" = "forward" ]; then
+        local fport="${FORWARD_PORT:-14000}"
+        log_info "Forward mode: checking that 127.0.0.1:${fport} accepts connections..."
+        if timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/${fport}" 2>/dev/null; then
+            log_success "Forward port ${fport} accepts connections (target: ${FORWARD_TARGET:-127.0.0.1:80})"
+            return 0
+        fi
+        log_error "Nothing is accepting connections on 127.0.0.1:${fport}"
+        return 1
+    else
+        port="${SOCKS_PORT:-1080}"
+    fi
+
+    log_info "Fetching $url through SOCKS5 127.0.0.1:${port}..."
+    local out rc=0
+    out=$(curl -s --max-time 20 --socks5-hostname "127.0.0.1:${port}" \
+        -w $'\n__PAQCTL__ %{http_code} %{time_connect} %{time_total}' "$url" 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log_error "Request through the tunnel failed (curl exit code $rc)"
+        echo -e "  ${DIM}Next steps: sudo paqctl doctor   |   sudo paqctl logs --errors --no-follow${NC}"
+        return 1
+    fi
+    local meta body code total exit_ip loc
+    meta=$(echo "$out" | grep '^__PAQCTL__' | tail -1)
+    body=$(echo "$out" | grep -v '^__PAQCTL__')
+    code=$(echo "$meta" | awk '{print $2}')
+    total=$(echo "$meta" | awk '{print $4}')
+    exit_ip=$(echo "$body" | sed -n 's/^ip=//p' | head -1)
+    loc=$(echo "$body" | sed -n 's/^loc=//p' | head -1)
+
+    if ! [[ "$code" =~ ^[23] ]]; then
+        log_error "Tunnel reached the site but got HTTP ${code:-?}"
+        return 1
+    fi
+    log_success "Tunnel works: HTTP ${code} in ${total}s"
+    [ -n "$exit_ip" ] && echo -e "  Exit IP:   ${BOLD}${exit_ip}${NC}${loc:+ (${loc})}"
+
+    if [ -n "$exit_ip" ]; then
+        local direct_ip
+        direct_ip=$(curl -s --max-time 5 "$url" 2>/dev/null | sed -n 's/^ip=//p' | head -1)
+        if [ -n "$direct_ip" ] && [ "$direct_ip" = "$exit_ip" ]; then
+            log_warn "The exit IP equals this machine's direct IP - traffic may not be going through the tunnel."
+        elif [ -n "$direct_ip" ]; then
+            echo -e "  Direct IP: ${direct_ip} ${DIM}(different from the exit IP, as expected)${NC}"
+        fi
+    fi
+    echo ""
+}
+
+#───────────────────────────────────────────────────────────────────────
+# Start/stop every installed backend, reporting partial failures
+#───────────────────────────────────────────────────────────────────────
+_start_all() {
+    local -a failed=()
+    local any=false
+    if _paqet_installed; then any=true; start_paqet_backend || failed+=(paqet); fi
+    if _gfk_installed; then any=true; start_gfk_backend || failed+=(gfk); fi
+    if [ "$any" != true ]; then
+        log_error "No backends are installed"
+        return 1
+    fi
+    if [ ${#failed[@]} -gt 0 ]; then
+        log_error "Failed to start: ${failed[*]}"
+        return 1
+    fi
+}
+
+_stop_all() {
+    local -a failed=()
+    if _paqet_installed; then stop_paqet_backend || failed+=(paqet); fi
+    if _gfk_installed; then stop_gfk_backend || failed+=(gfk); fi
+    if [ ${#failed[@]} -gt 0 ]; then
+        log_error "Failed to stop: ${failed[*]}"
+        return 1
+    fi
 }
 
 show_version() {
@@ -7693,7 +9266,7 @@ show_settings_menu() {
             a|A) install_additional_backend; redraw=true ;;
             s|S) switch_backend; redraw=true ;;
             0) tune_menu; redraw=true ;;
-            u|U) uninstall_paqctl; exit 0 ;;
+            u|U) uninstall_paqctl; [ -d "$INSTALL_DIR" ] || exit 0; redraw=true ;;
             b|B) return ;;
             "") ;;
             *) echo -e "  ${RED}Invalid choice${NC}" ;;
@@ -7968,68 +9541,92 @@ show_info_menu() {
 # Connection Info Display
 #═══════════════════════════════════════════════════════════════════════
 
+# show_connection_info [--ip ADDR] [--qr]   (supports --json)
 show_connection_info() {
-    clear
+    local -a export_args=("$@")
+    _load_settings
+
+    local local_ip
+    local_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}')
+    [ -n "$local_ip" ] || local_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [ -n "$local_ip" ] || local_ip="unknown"
+
+    local paqet_installed=false gfk_installed=false
+    _paqet_installed && paqet_installed=true
+    _gfk_installed && gfk_installed=true
+
+    local paqet_port="${LISTEN_PORT:-8443}"
+    local paqet_key="${ENCRYPTION_KEY:-}"
+    if [ -z "$paqet_key" ] && [ -f "$INSTALL_DIR/config.yaml" ]; then
+        paqet_key=$(grep -E '^[[:space:]]*key:' "$INSTALL_DIR/config.yaml" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"' || true)
+    fi
+    local gfk_ip="${GFK_SERVER_IP:-$local_ip}"
+    local gfk_auth="${GFK_AUTH_CODE:-}"
+    local gfk_mappings="${GFK_PORT_MAPPINGS:-14000:443}"
+
+    if [ "$JSON_OUTPUT" = true ]; then
+        local uri="" host=""
+        if [ "$paqet_installed" = true ] || [ "$gfk_installed" = true ]; then
+            local _a override=""
+            for ((_a = 0; _a < ${#export_args[@]}; _a++)); do
+                case "${export_args[$_a]}" in
+                    --ip) override="${export_args[$((_a + 1))]:-}" ;;
+                    --ip=*) override="${export_args[$_a]#--ip=}" ;;
+                esac
+            done
+            host=$(_export_host "$override" 2>/dev/null) && uri=$(_build_export_uri "$host" 2>/dev/null)
+        fi
+        printf '{"role":%s,"backend":%s,' "$(_json_str "$ROLE")" "$(_json_str "$BACKEND")"
+        if [ "$paqet_installed" = true ]; then
+            printf '"paqet":{"server":%s,"port":%s,"key":%s,"client_socks":%s},' \
+                "$(_json_str "$local_ip")" "$(_json_num "$paqet_port")" "$(_json_str "$paqet_key")" "$(_json_str "127.0.0.1:${SOCKS_PORT:-1080}")"
+        else
+            printf '"paqet":null,'
+        fi
+        if [ "$gfk_installed" = true ]; then
+            printf '"gfk":{"server_ip":%s,"auth_code":%s,"port_mappings":%s,"vio_port":%s,"quic_port":%s,"client_socks":%s},' \
+                "$(_json_str "$gfk_ip")" "$(_json_str "$gfk_auth")" "$(_json_str "$gfk_mappings")" \
+                "$(_json_num "${GFK_VIO_PORT:-45000}")" "$(_json_num "${GFK_QUIC_PORT:-25000}")" "$(_json_str "127.0.0.1:$(_gfk_client_socks_port)")"
+        else
+            printf '"gfk":null,'
+        fi
+        printf '"uri":%s}\n' "$(if [ -n "$uri" ]; then _json_str "$uri"; else printf 'null'; fi)"
+        return 0
+    fi
+
+    [ "$MENU_MODE" = true ] && clear
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}  CLIENT CONNECTION INFO${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
 
-    _load_settings
-
-    local local_ip
-    local_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown")
-
-    local paqet_installed=false
-    local gfk_installed=false
-    [ -f "$INSTALL_DIR/bin/paqet" ] && paqet_installed=true
-    if [ "$ROLE" = "server" ]; then
-        [ -d "$GFK_DIR" ] && [ -f "$GFK_DIR/quic_server.py" ] && gfk_installed=true
-    else
-        [ -d "$GFK_DIR" ] && [ -f "$GFK_DIR/quic_client.py" ] && gfk_installed=true
-    fi
-
     if [ "$paqet_installed" = true ]; then
         echo -e "  ${GREEN}${BOLD}━━━ PAQET ━━━${NC}"
         echo ""
-        local paqet_port="${LISTEN_PORT:-8443}"
-        local paqet_key="${ENCRYPTION_KEY:-not set}"
-        # Try to get key from config if not in settings
-        if [ "$paqet_key" = "not set" ] && [ -f "$INSTALL_DIR/config.yaml" ]; then
-            paqet_key=$(grep -E "^key:" "$INSTALL_DIR/config.yaml" 2>/dev/null | awk '{print $2}' | tr -d '"' || echo "not set")
-        fi
         echo -e "  ${YELLOW}╔═══════════════════════════════════════════════════════════╗${NC}"
         echo -e "  ${YELLOW}║${NC}  Server:  ${BOLD}${local_ip}:${paqet_port}${NC}"
-        echo -e "  ${YELLOW}║${NC}  Key:     ${BOLD}${paqet_key}${NC}"
+        echo -e "  ${YELLOW}║${NC}  Key:     ${BOLD}${paqet_key:-not set}${NC}"
         echo -e "  ${YELLOW}╚═══════════════════════════════════════════════════════════╝${NC}"
         echo ""
-        echo -e "  ${DIM}Client proxy: 127.0.0.1:1080 (SOCKS5)${NC}"
+        echo -e "  ${DIM}Client proxy: 127.0.0.1:${SOCKS_PORT:-1080} (SOCKS5)${NC}"
         echo ""
     fi
 
     if [ "$gfk_installed" = true ]; then
         echo -e "  ${MAGENTA}${BOLD}━━━ GFW-KNOCKER ━━━${NC}"
         echo ""
-        local gfk_ip="${GFK_SERVER_IP:-$local_ip}"
-        local gfk_auth="${GFK_AUTH_CODE:-not set}"
-        local gfk_mappings="${GFK_PORT_MAPPINGS:-14000:443}"
         echo -e "  ${YELLOW}╔═══════════════════════════════════════════════════════════╗${NC}"
         echo -e "  ${YELLOW}║${NC}  Server IP:  ${BOLD}${gfk_ip}${NC}"
-        echo -e "  ${YELLOW}║${NC}  Auth Code:  ${BOLD}${gfk_auth}${NC}"
+        echo -e "  ${YELLOW}║${NC}  Auth Code:  ${BOLD}${gfk_auth:-not set}${NC}"
         echo -e "  ${YELLOW}║${NC}  Mappings:   ${BOLD}${gfk_mappings}${NC}"
         echo -e "  ${YELLOW}╚═══════════════════════════════════════════════════════════╝${NC}"
         echo ""
         echo -e "  ${DIM}VIO port: ${GFK_VIO_PORT:-45000} | QUIC port: ${GFK_QUIC_PORT:-25000}${NC}"
-        local _gfk_proxy_port
-        if [ -n "${GFK_SOCKS_VIO_PORT:-}" ]; then
-            _gfk_proxy_port="$GFK_SOCKS_VIO_PORT"
-        else
-            _gfk_proxy_port=$(echo "${GFK_PORT_MAPPINGS:-14000:443}" | cut -d, -f1 | cut -d: -f1)
-        fi
-        echo -e "  ${DIM}Client proxy: 127.0.0.1:${_gfk_proxy_port} (SOCKS5)${NC}"
+        echo -e "  ${DIM}Client proxy: 127.0.0.1:$(_gfk_client_socks_port) (SOCKS5)${NC}"
         echo ""
     fi
 
+    local rc=0
     if [ "$paqet_installed" = false ] && [ "$gfk_installed" = false ]; then
         echo -e "  ${YELLOW}No backends installed yet.${NC}"
         echo ""
@@ -8038,11 +9635,15 @@ show_connection_info() {
         echo ""
         echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
         echo ""
+        rc=1
     else
-        export_config_string
+        export_config_string "${export_args[@]}" || rc=$?
     fi
 
-    read -n 1 -s -r -p "  Press any key to return..." < /dev/tty || true
+    if [ "$MENU_MODE" = true ]; then
+        read -n 1 -s -r -p "  Press any key to return..." < /dev/tty || true
+    fi
+    return $rc
 }
 
 #═══════════════════════════════════════════════════════════════════════
@@ -8050,6 +9651,11 @@ show_connection_info() {
 #═══════════════════════════════════════════════════════════════════════
 
 show_menu() {
+    MENU_MODE=true
+    if ! _has_tty; then
+        log_error "The interactive menu needs a terminal. Run 'paqctl help' for scriptable commands."
+        return 1
+    fi
     # Auto-fix systemd service if in failed state
     if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
         local svc_state=$(systemctl is-active paqctl.service 2>/dev/null)
@@ -8082,8 +9688,8 @@ show_menu() {
 
             # Status line showing both backends
             local boot_badge=""
-            if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
-                if systemctl is-enabled paqctl.service &>/dev/null; then
+            if _init_system >/dev/null; then
+                if _boot_enabled; then
                     boot_badge="  |  Boot: ${GREEN}enabled${NC}"
                 else
                     boot_badge="  |  Boot: ${YELLOW}disabled${NC}"
@@ -8253,23 +9859,17 @@ show_menu() {
                 ;;
             r|R) restart_paqet; read -n 1 -s -r -p "  Press any key to return..." < /dev/tty || true; redraw=true ;;
             b|B)
-                if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
-                    if systemctl is-enabled paqctl.service &>/dev/null; then
-                        systemctl disable paqctl.service 2>/dev/null || true
-                        log_info "Auto-start on boot DISABLED"
-                    else
-                        systemctl enable paqctl.service 2>/dev/null || true
-                        log_success "Auto-start on boot ENABLED"
-                    fi
+                if _boot_enabled; then
+                    _set_boot disable || true
                 else
-                    log_warn "Systemd not detected or supported for toggle."
+                    _set_boot enable || true
                 fi
                 read -n 1 -s -r -p "  Press any key to return..." < /dev/tty || true; redraw=true ;;
             8) show_settings_menu; redraw=true ;;
             t|T) tune_menu; redraw=true ;;
             c|C) show_connection_info; redraw=true ;;
             i|I) show_info_menu; redraw=true ;;
-            u|U) uninstall_paqctl; exit 0 ;;
+            u|U) uninstall_paqctl; [ -d "$INSTALL_DIR" ] || exit 0; redraw=true ;;
             0) echo "  Exiting."; exit 0 ;;
             "") ;;
             *) echo -e "  ${RED}Invalid choice: ${NC}${YELLOW}$choice${NC}" ;;
@@ -8281,58 +9881,113 @@ show_menu() {
 # CLI Command Router
 #═══════════════════════════════════════════════════════════════════════
 
-case "${1:-menu}" in
-    status)           show_status ;;
-    start)            start_paqet ;;
-    stop)             stop_paqet ;;
-    restart)          restart_paqet ;;
-    start-paqet)      start_paqet_backend ;;
-    stop-paqet)       stop_paqet_backend ;;
-    start-gfk)        start_gfk_backend ;;
-    stop-gfk)         stop_gfk_backend ;;
-    start-all)        start_paqet_backend; start_gfk_backend ;;
-    stop-all)         stop_paqet_backend; stop_gfk_backend ;;
-    logs)             show_logs ;;
-    health)           health_check ;;
-    update)           update_paqet ;;
-    config)           change_config ;;
-    secret)           generate_secret ;;
-    firewall)         show_firewall ;;
-    rollback)         rollback_paqet ;;
-    ping)             run_ping ;;
-    dump)             run_dump ;;
-    backup)           backup_config ;;
-    restore)          restore_config ;;
-    top|monitor|clients) show_active_clients ;;
-    speed|speedtest)  run_speedtest ;;
-    dns|routing|check-dns) check_proxy_routing ;;
-    ban|unban)        manage_ip_ban "$1" "$2" ;;
-    rotate|rotate-key) rotate_key ;;
-    clean|cleanup)    system_cleanup ;;
-    export|share)     export_config_string ;;
-    import)           import_config_string ;;
-    turbo)            apply_turbo_mode ;;
-    turbo-off)        remove_turbo_mode ;;
-    watchdog)         manage_watchdog "${2:-status}" ;;
-    tune|tuning)      tune_menu ;;
-    info|details|client) show_connection_info ;;
-    enable|boot-enable)
-        if command -v systemctl &>/dev/null; then systemctl enable paqctl.service && log_success "Auto-start enabled"; fi ;;
-    disable|boot-disable)
-        if command -v systemctl &>/dev/null; then systemctl disable paqctl.service && log_success "Auto-start disabled"; fi ;;
-    telegram)         show_telegram_menu ;;
-    uninstall)        uninstall_paqctl ;;
-    version)          show_version ;;
-    help|--help|-h)   show_help ;;
-    menu)             show_menu ;;
-    _apply-firewall)  _apply_firewall ;;
-    _remove-firewall) _remove_firewall ;;
-    *)
-        echo -e "${RED}Unknown command: $1${NC}"
-        echo "Run 'sudo paqctl help' for usage."
-        exit 1
-        ;;
-esac
+_main() {
+    local input="${1:-menu}" cmd
+    case "$input" in
+        # Internal hooks used by the service units
+        _apply-firewall)  _require_root || return 1; _apply_firewall; return ;;
+        _remove-firewall) _require_root || return 1; _remove_firewall; return ;;
+        # Hidden: list command words (completion/tests)
+        commands) _command_words; return 0 ;;
+    esac
+
+    if ! cmd=$(_resolve_command "$input"); then
+        echo -e "${RED}Unknown command: ${input}${NC}" >&2
+        local guess
+        if guess=$(_suggest_command "$input"); then
+            echo -e "Did you mean: ${BOLD}paqctl ${guess}${NC} ?" >&2
+        fi
+        echo "Run 'paqctl help' for the list of commands." >&2
+        return 2
+    fi
+    [ $# -gt 0 ] && shift
+
+    case "$cmd" in
+        help|version|completion) ;;
+        *) _require_root || return 1 ;;
+    esac
+
+    # Serialise commands that change state (the watchdog skips instead of waiting)
+    case "$cmd" in
+        start|stop|restart|start-paqet|stop-paqet|start-gfk|stop-gfk|start-all|stop-all|\
+        update|self-update|rollback|import|rotate-key|restore|ban|unban|turbo|turbo-off|\
+        tune|cleanup|uninstall|enable|disable)
+            _acquire_lock || return 1 ;;
+        config)
+            [ "${1:-}" = "show" ] || { _acquire_lock || return 1; } ;;
+        watchdog)
+            case "${1:-status}" in
+                check) _acquire_lock nowait || return 0 ;;
+                enable|disable) _acquire_lock || return 1 ;;
+            esac ;;
+        doctor)
+            case " $* " in *" --fix "*) _acquire_lock || return 1 ;; esac ;;
+    esac
+
+    case "$cmd" in
+        menu)        show_menu ;;
+        status)      show_status ;;
+        info)        show_connection_info "$@" ;;
+        help)        show_help "$@" ;;
+        version)     show_version ;;
+        completion)  show_completion "$@" ;;
+        start)       start_paqet ;;
+        stop)        stop_paqet ;;
+        restart)     restart_paqet ;;
+        start-paqet) start_paqet_backend ;;
+        stop-paqet)  stop_paqet_backend ;;
+        start-gfk)   start_gfk_backend ;;
+        stop-gfk)    stop_gfk_backend ;;
+        start-all)   _start_all ;;
+        stop-all)    _stop_all ;;
+        enable)      _set_boot enable ;;
+        disable)     _set_boot disable ;;
+        watchdog)
+            case "${1:-status}" in
+                enable|disable|status|check) manage_watchdog "${1:-status}" ;;
+                *) log_error "Usage: paqctl watchdog [enable|disable|status]"; return 2 ;;
+            esac ;;
+        health)      health_check ;;
+        doctor)      run_doctor "$@" ;;
+        test)        run_e2e_test "$@" ;;
+        logs)        show_logs "$@" ;;
+        ping)        run_ping ;;
+        dump)        run_dump ;;
+        monitor)     show_active_clients ;;
+        speedtest)   run_speedtest ;;
+        routing)     check_proxy_routing ;;
+        config)      config_command "$@" ;;
+        export)      export_config_string "$@" ;;
+        import)      import_config_string "$@" ;;
+        rotate-key)  rotate_key ;;
+        secret)      generate_secret ;;
+        tune)        tune_menu ;;
+        turbo)       apply_turbo_mode ;;
+        turbo-off)   remove_turbo_mode ;;
+        telegram)    show_telegram_menu ;;
+        firewall)    show_firewall ;;
+        ban)         manage_ip_ban ban "${1:-}" ;;
+        unban)       manage_ip_ban unban "${1:-}" ;;
+        backup)      backup_config "$@" ;;
+        restore)     restore_config "$@" ;;
+        update)      update_paqet ;;
+        self-update) update_management_script ;;
+        rollback)    rollback_paqet ;;
+        cleanup)     system_cleanup "$@" ;;
+        uninstall)   uninstall_paqctl ;;
+        *)
+            # A registry entry without a handler is a bug
+            log_error "Command '$cmd' is registered but not implemented"
+            return 70
+            ;;
+    esac
+}
+
+# Tests source this file with PAQCTL_SOURCE_ONLY=1 to reach the functions
+if [ "${PAQCTL_SOURCE_ONLY:-}" != "1" ]; then
+    _main "$@"
+    exit $?
+fi
 MANAGEMENT
 
     # Replace placeholder
@@ -8353,6 +10008,22 @@ MANAGEMENT
     rm -f /usr/local/bin/paqctl 2>/dev/null
     if ! ln -sf "$INSTALL_DIR/paqctl" /usr/local/bin/paqctl; then
         log_warn "Failed to create symlink /usr/local/bin/paqctl"
+    fi
+
+    # Bash completion (generated from the management script's command table)
+    local _comp_dir=""
+    if [ -d /usr/share/bash-completion/completions ]; then
+        _comp_dir=/usr/share/bash-completion/completions
+    elif [ -d /etc/bash_completion.d ]; then
+        _comp_dir=/etc/bash_completion.d
+    fi
+    if [ -n "$_comp_dir" ]; then
+        if "$INSTALL_DIR/paqctl" completion bash > "$_comp_dir/paqctl.tmp" 2>/dev/null && [ -s "$_comp_dir/paqctl.tmp" ]; then
+            mv -f "$_comp_dir/paqctl.tmp" "$_comp_dir/paqctl"
+            chmod 644 "$_comp_dir/paqctl" 2>/dev/null || true
+        else
+            rm -f "$_comp_dir/paqctl.tmp" 2>/dev/null
+        fi
     fi
 
     log_success "Management script installed → /usr/local/bin/paqctl"
