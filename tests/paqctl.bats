@@ -27,6 +27,30 @@ load_paqctl() {
     bash -n "$P"
 }
 
+@test "paqctl.sh is up to date with src/" {
+    run bash "$ROOT/build.sh" --check
+    echo "$output"
+    [ "$status" -eq 0 ]
+}
+
+@test "no function is defined in more than one source file" {
+    # Shared code lives in src/lib and is included into both scripts by build.sh
+    # (definitions inside heredocs belong to generated helper scripts and are skipped)
+    run bash -c '
+        cd "$1/src"
+        for f in lib/*.sh installer/*.sh management/*.sh; do
+            awk -v f="$f" "
+                hd != \"\" { if (\$0 == hd) hd = \"\"; next }
+                /^[A-Za-z_][A-Za-z0-9_]*\\(\\) *\\{/ { n = \$0; sub(/\\(.*/, \"\", n); print n, f }
+                match(\$0, /<<-? *[\x27\"]?[A-Za-z_][A-Za-z0-9_]*[\x27\"]? *\$/) && \$0 !~ /<<</ {
+                    hd = substr(\$0, RSTART); gsub(/[<\x27\" -]/, \"\", hd)
+                }" "$f"
+        done | sort | awk "{ if (\$1 == prev && \$2 != prevf) print \"duplicate: \" \$1 \" in \" prevf \" and \" \$2; prev = \$1; prevf = \$2 }"' _ "$ROOT"
+    echo "$output"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
 @test "help lists every registered command" {
     run "$P" help
     [ "$status" -eq 0 ]

@@ -30,6 +30,15 @@ if [ -z "$BASH_VERSION" ]; then
     exit 1
 fi
 
+# GENERATED FILE - do not edit paqctl.sh directly.
+# Edit the sources in src/ and run ./build.sh (CI checks that they match).
+
+INSTALL_DIR="${INSTALL_DIR:-/opt/paqctl}"
+BACKEND="${BACKEND:-paqet}"
+# shellcheck shell=bash
+# Versions, repositories and colours shared by the installer and the management script.
+# INSTALL_DIR must be set before this file is included.
+
 VERSION="1.2.0"
 
 # Pinned versions for stability (update these after testing new releases)
@@ -39,14 +48,13 @@ GFK_VERSION_PINNED="v1.0.0"
 
 PAQET_REPO="4H1R/paqet"
 PAQET_API_URL="https://api.github.com/repos/${PAQET_REPO}/releases/latest"
-INSTALL_DIR="${INSTALL_DIR:-/opt/paqctl}"
-BACKUP_DIR="$INSTALL_DIR/backups"
 GFK_REPO="4H1R/paqctl"
 GFK_BRANCH="main"
 GFK_RAW_URL="https://raw.githubusercontent.com/${GFK_REPO}/${GFK_BRANCH}/gfk"
-GFK_DIR="$INSTALL_DIR/gfk"
 MICROSOCKS_REPO="rofl0r/microsocks"
-BACKEND="${BACKEND:-paqet}"
+
+BACKUP_DIR="$INSTALL_DIR/backups"
+GFK_DIR="$INSTALL_DIR/gfk"
 
 # Colors
 RED='\033[0;31m'
@@ -58,10 +66,41 @@ MAGENTA='\033[0;35m'
 BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
+# shellcheck shell=bash
+# Shared helpers used by both the installer and the management script.
+# Included into both the installer and the management script by build.sh.
 
 #═══════════════════════════════════════════════════════════════════════
-# Utility Functions
+# Input validation
 #═══════════════════════════════════════════════════════════════════════
+
+_validate_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+_validate_ip() {
+    [[ "$1" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+    local IFS='.'; set -- $1
+    [ "$1" -le 255 ] && [ "$2" -le 255 ] && [ "$3" -le 255 ] && [ "$4" -le 255 ]
+}
+
+_validate_mac() { [[ "$1" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; }
+
+_validate_iface() { [[ "$1" =~ ^[a-zA-Z0-9._-]+$ ]] && [ ${#1} -le 64 ]; }
+
+_validate_version_tag() {
+    # Strict validation: only allow vX.Y.Z or X.Y.Z format with optional -suffix
+    [[ "$1" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?$ ]]
+}
+
+#═══════════════════════════════════════════════════════════════════════
+# Logging & output
+#═══════════════════════════════════════════════════════════════════════
+
+# In --json mode, human-readable log lines go to stderr so stdout stays valid JSON
+_log_fd() { if [ "${JSON_OUTPUT:-false}" = true ]; then cat >&2; else cat; fi; }
+log_info()    { echo -e "${BLUE}[INFO]${NC} $1" | _log_fd; }
+log_success() { echo -e "${GREEN}[✓]${NC} $1" | _log_fd; }
+log_warn()    { echo -e "${YELLOW}[!]${NC} $1" | _log_fd; }
+log_error()   { echo -e "${RED}[✗]${NC} $1" >&2; }
 
 print_header() {
     echo -e "${CYAN}"
@@ -72,94 +111,142 @@ print_header() {
     echo -e "${NC}"
 }
 
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
+#═══════════════════════════════════════════════════════════════════════
+# Network & system detection
+#═══════════════════════════════════════════════════════════════════════
 
-log_success() {
-    echo -e "${GREEN}[✓]${NC} $1"
-}
-
-log_warn() {
-    echo -e "${YELLOW}[!]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[✗]${NC} $1"
-}
-
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        log_error "This script must be run as root (use sudo)"
-        exit 1
-    fi
-}
-
-detect_os() {
-    OS="unknown"
-    OS_VERSION="unknown"
-    OS_FAMILY="unknown"
-    HAS_SYSTEMD=false
-    PKG_MANAGER="unknown"
-
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS="$ID"
-        OS_VERSION="${VERSION_ID:-unknown}"
-    elif [ -f /etc/redhat-release ]; then
-        OS="rhel"
-    elif [ -f /etc/debian_version ]; then
-        OS="debian"
-    elif [ -f /etc/alpine-release ]; then
-        OS="alpine"
-    elif [ -f /etc/arch-release ]; then
-        OS="arch"
-    elif [ -f /etc/SuSE-release ] || [ -f /etc/SUSE-brand ]; then
-        OS="opensuse"
-    else
-        OS=$(uname -s | tr '[:upper:]' '[:lower:]')
-    fi
-
-    case "$OS" in
-        ubuntu|debian|linuxmint|pop|elementary|zorin|kali|raspbian)
-            OS_FAMILY="debian"
-            PKG_MANAGER="apt"
-            ;;
-        rhel|centos|fedora|rocky|almalinux|oracle|amazon|amzn)
-            OS_FAMILY="rhel"
-            if command -v dnf &>/dev/null; then
-                PKG_MANAGER="dnf"
-            else
-                PKG_MANAGER="yum"
+# Retry helper with exponential backoff for API requests
+_curl_with_retry() {
+    local url="$1"
+    local max_attempts="${2:-3}"
+    local attempt=1
+    local delay=2
+    local response=""
+    while [ $attempt -le $max_attempts ]; do
+        response=$(curl -s --max-time 15 "$url" 2>/dev/null)
+        if [ -n "$response" ]; then
+            # Check for rate limit response
+            if echo "$response" | grep -q '"message".*rate limit'; then
+                log_warn "GitHub API rate limited, waiting ${delay}s (attempt $attempt/$max_attempts)"
+                sleep $delay
+                delay=$((delay * 2))
+                attempt=$((attempt + 1))
+                continue
             fi
-            ;;
-        arch|manjaro|endeavouros|garuda)
-            OS_FAMILY="arch"
-            PKG_MANAGER="pacman"
-            ;;
-        opensuse|opensuse-leap|opensuse-tumbleweed|sles)
-            OS_FAMILY="suse"
-            PKG_MANAGER="zypper"
-            ;;
-        alpine)
-            OS_FAMILY="alpine"
-            PKG_MANAGER="apk"
-            ;;
+            echo "$response"
+            return 0
+        fi
+        [ $attempt -lt $max_attempts ] && sleep $delay
+        delay=$((delay * 2))
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+detect_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7l|armv7|armhf) echo "arm32" ;;
+        mips64el|mips64le) echo "mips64le" ;;
+        mips64) echo "mips64" ;;
+        mipsel|mipsle) echo "mipsle" ;;
+        mips) echo "mips" ;;
         *)
-            OS_FAMILY="unknown"
-            PKG_MANAGER="unknown"
+            log_error "Unsupported architecture: $arch"
+            log_error "Paqet supports amd64, arm64, arm32, and MIPS variants"
+            return 1
             ;;
     esac
+}
 
-    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
-        HAS_SYSTEMD=true
+detect_network() {
+    log_info "Auto-detecting network configuration..."
+
+    # Default interface - handle both standard "via X dev Y" and OpenVZ "dev Y scope link" formats
+    # Standard: "default via 192.168.1.1 dev eth0" -> $5 = eth0
+    # OpenVZ:   "default dev venet0 scope link"   -> $3 = venet0
+    local _route_line
+    _route_line=$(ip route show default 2>/dev/null | head -1)
+    if [[ "$_route_line" == *" via "* ]]; then
+        # Standard format with gateway
+        DETECTED_IFACE=$(echo "$_route_line" | awk '{print $5}')
+    elif [[ "$_route_line" == *" dev "* ]]; then
+        # OpenVZ/direct format without gateway
+        DETECTED_IFACE=$(echo "$_route_line" | awk '{print $3}')
     fi
 
-    log_info "Detected: $OS ($OS_FAMILY family), Package manager: $PKG_MANAGER"
+    # Validate detected interface exists
+    if [ -n "$DETECTED_IFACE" ] && ! ip link show "$DETECTED_IFACE" &>/dev/null; then
+        DETECTED_IFACE=""
+    fi
+
+    if [ -z "$DETECTED_IFACE" ]; then
+        # Skip loopback, docker, veth, bridge, and other virtual interfaces
+        # Note: grep -v returns exit 1 if no matches, so we add || true for pipefail
+        DETECTED_IFACE=$(ip -o link show 2>/dev/null | awk -F': ' '{gsub(/ /,"",$2); print $2}' | { grep -vE '^(lo|docker[0-9]|br-|veth|virbr|tun|tap|wg)' || true; } | head -1)
+    fi
+
+    # Local IP - wrap entire pipeline to prevent pipefail exit
+    if [ -n "$DETECTED_IFACE" ]; then
+        # Note: wrap in subshell with || true to handle cases where interface is invalid or has no IP
+        DETECTED_IP=$( (ip -4 addr show "$DETECTED_IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | { grep -o '[0-9.]*' || true; } | head -1) || true )
+    fi
+    if [ -z "$DETECTED_IP" ]; then
+        DETECTED_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+        [ -z "$DETECTED_IP" ] && DETECTED_IP=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{gsub(/\/.*/, "", $2); print $2; exit}')
+    fi
+
+    # Gateway IP - only present in standard "via X" format, not in OpenVZ
+    if [[ "$_route_line" == *" via "* ]]; then
+        DETECTED_GATEWAY=$(echo "$_route_line" | awk '{print $3}')
+    else
+        DETECTED_GATEWAY=""
+    fi
+
+    # Gateway MAC
+    DETECTED_GW_MAC=""
+    if [ -n "$DETECTED_GATEWAY" ]; then
+        # Try ip neigh first (most reliable on Linux)
+        DETECTED_GW_MAC=$(ip neigh show "$DETECTED_GATEWAY" 2>/dev/null | awk '/lladdr/{print $5; exit}')
+        if [ -z "$DETECTED_GW_MAC" ]; then
+            # Trigger ARP resolution
+            ping -c 1 -W 2 "$DETECTED_GATEWAY" &>/dev/null || true
+            sleep 1
+            DETECTED_GW_MAC=$(ip neigh show "$DETECTED_GATEWAY" 2>/dev/null | awk '/lladdr/{print $5; exit}')
+        fi
+        if [ -z "$DETECTED_GW_MAC" ] && command -v arp &>/dev/null; then
+            # Fallback: parse arp output looking for MAC pattern
+            # Note: grep returns exit 1 if no matches, so we add || true for pipefail
+            DETECTED_GW_MAC=$(arp -n "$DETECTED_GATEWAY" 2>/dev/null | { grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' || true; } | head -1)
+        fi
+    fi
+
+    log_info "Interface: ${DETECTED_IFACE:-unknown}"
+    log_info "Local IP:  ${DETECTED_IP:-unknown}"
+    log_info "Gateway:   ${DETECTED_GATEWAY:-unknown}"
+    log_info "GW MAC:    ${DETECTED_GW_MAC:-unknown}"
+}
+
+# Package manager for install_package. The installer sets PKG_MANAGER in
+# detect_os; the management script detects it on first use.
+_ensure_pkg_manager() {
+    [ -n "${PKG_MANAGER:-}" ] && [ "$PKG_MANAGER" != "unknown" ] && return 0
+    if command -v apt-get &>/dev/null; then PKG_MANAGER="apt"
+    elif command -v dnf &>/dev/null; then PKG_MANAGER="dnf"
+    elif command -v yum &>/dev/null; then PKG_MANAGER="yum"
+    elif command -v pacman &>/dev/null; then PKG_MANAGER="pacman"
+    elif command -v zypper &>/dev/null; then PKG_MANAGER="zypper"
+    elif command -v apk &>/dev/null; then PKG_MANAGER="apk"
+    else PKG_MANAGER="unknown"
+    fi
 }
 
 install_package() {
     local package="$1"
+    _ensure_pkg_manager
     log_info "Installing $package..."
 
     case "$PKG_MANAGER" in
@@ -219,194 +306,205 @@ install_package() {
     esac
 }
 
-check_dependencies() {
-    if [ "$OS_FAMILY" = "alpine" ]; then
-        if ! command -v bash &>/dev/null; then
-            apk add --no-cache bash 2>/dev/null
-        fi
-    fi
+#═══════════════════════════════════════════════════════════════════════
+# Firewall persistence
+#═══════════════════════════════════════════════════════════════════════
 
-    if ! command -v curl &>/dev/null; then
-        install_package curl || log_warn "Could not install curl automatically"
-    fi
-
-    if ! command -v tar &>/dev/null; then
-        install_package tar || log_warn "Could not install tar automatically"
-    fi
-
-    if ! command -v ip &>/dev/null; then
-        case "$PKG_MANAGER" in
-            apt) install_package iproute2 || log_warn "Could not install iproute2" ;;
-            dnf|yum) install_package iproute || log_warn "Could not install iproute" ;;
-            pacman) install_package iproute2 || log_warn "Could not install iproute2" ;;
-            zypper) install_package iproute2 || log_warn "Could not install iproute2" ;;
-            apk) install_package iproute2 || log_warn "Could not install iproute2" ;;
-        esac
-    fi
-
-    if ! command -v tput &>/dev/null; then
-        case "$PKG_MANAGER" in
-            apt) install_package ncurses-bin || log_warn "Could not install ncurses-bin" ;;
-            apk) install_package ncurses || log_warn "Could not install ncurses" ;;
-            *) install_package ncurses || log_warn "Could not install ncurses" ;;
-        esac
-    fi
-
-    # Firewall rules: use firewalld if active, otherwise iptables
-    if _is_firewalld_active; then
-        log_info "firewalld detected — will use firewall-cmd for rules"
-    elif ! command -v iptables &>/dev/null; then
-        log_info "Installing iptables..."
-        case "$PKG_MANAGER" in
-            apt) install_package iptables || log_warn "Could not install iptables - firewall rules may not work" ;;
-            dnf|yum) install_package iptables || log_warn "Could not install iptables" ;;
-            pacman) install_package iptables || log_warn "Could not install iptables" ;;
-            zypper) install_package iptables || log_warn "Could not install iptables" ;;
-            apk) install_package iptables || log_warn "Could not install iptables" ;;
-            *) log_warn "Please install iptables manually for firewall rules to work" ;;
-        esac
-    fi
-
-    # openssl is required for GFK certificate generation
-    if ! command -v openssl &>/dev/null; then
-        install_package openssl || log_warn "Could not install openssl"
-    fi
-
-    # libpcap is required by paqet
-    install_libpcap
+_is_firewalld_active() {
+    command -v firewall-cmd &>/dev/null && firewall-cmd --state 2>/dev/null | grep -q running
 }
 
-install_libpcap() {
-    log_info "Checking for libpcap..."
-
-    # Check if already available
-    if ldconfig -p 2>/dev/null | grep -q libpcap; then
-        log_success "libpcap already installed"
+persist_iptables_rules() {
+    if _is_firewalld_active; then
+        firewall-cmd --runtime-to-permanent 2>/dev/null || true
         return 0
     fi
-
-    case "$PKG_MANAGER" in
-        apt) install_package libpcap-dev ;;
-        dnf|yum) install_package libpcap-devel ;;
-        pacman) install_package libpcap ;;
-        zypper) install_package libpcap-devel ;;
-        apk) install_package libpcap-dev ;;
-        *) log_warn "Please install libpcap manually for your distribution"; return 1 ;;
-    esac
-
-    # Fedora/RHEL: ensure libpcap.so.1 symlink exists (package may only install versioned .so)
-    if [ "$PKG_MANAGER" = "dnf" ] || [ "$PKG_MANAGER" = "yum" ]; then
-        if ! ldconfig -p 2>/dev/null | grep -q 'libpcap\.so\.1 '; then
-            local _pcap_lib
-            _pcap_lib=$(find /usr/lib64 /usr/lib /lib64 /lib -name 'libpcap.so.*' -type f 2>/dev/null | head -1)
-            if [ -n "$_pcap_lib" ]; then
-                local _libdir
-                _libdir=$(dirname "$_pcap_lib")
-                if [ ! -e "${_libdir}/libpcap.so.1" ]; then
-                    log_info "Creating libpcap.so.1 symlink for Fedora/RHEL compatibility"
-                    ln -sf "$_pcap_lib" "${_libdir}/libpcap.so.1"
-                fi
-                ldconfig 2>/dev/null || true
-            fi
+    if [ -x /etc/init.d/iptables ]; then
+        /etc/init.d/iptables save 2>/dev/null || true
+    fi
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save 2>/dev/null || true
+    elif command -v iptables-save &>/dev/null; then
+        if [ -d /etc/iptables ]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            command -v ip6tables-save &>/dev/null && { ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true; }
+        elif [ -f /etc/debian_version ]; then
+            mkdir -p /etc/iptables
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            command -v ip6tables-save &>/dev/null && { ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true; }
+        elif [ -d /etc/sysconfig ]; then
+            iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+            command -v ip6tables-save &>/dev/null && { ip6tables-save > /etc/sysconfig/ip6tables 2>/dev/null || true; }
         fi
     fi
-}
-
-detect_arch() {
-    local arch
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64|amd64) echo "amd64" ;;
-        aarch64|arm64) echo "arm64" ;;
-        armv7l|armv7|armhf) echo "arm32" ;;
-        mips64el|mips64le) echo "mips64le" ;;
-        mips64) echo "mips64" ;;
-        mipsel|mipsle) echo "mipsle" ;;
-        mips) echo "mips" ;;
-        *)
-            log_error "Unsupported architecture: $arch"
-            log_error "Paqet supports amd64, arm64, arm32, and MIPS variants"
-            exit 1
-            ;;
-    esac
+    if command -v nft &>/dev/null && [ -f /etc/nftables.conf ]; then
+        nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+    fi
 }
 
 #═══════════════════════════════════════════════════════════════════════
-# Input Validation Functions
+# Settings (settings.conf)
 #═══════════════════════════════════════════════════════════════════════
 
-_validate_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
-
-_validate_ip() {
-    [[ "$1" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
-    local IFS='.'; set -- $1
-    [ "$1" -le 255 ] && [ "$2" -le 255 ] && [ "$3" -le 255 ] && [ "$4" -le 255 ]
+# _load_settings [KEY...]
+# Load settings.conf into shell variables (no eval). With KEY arguments only
+# those keys are loaded, e.g. to carry Telegram settings over a reinstall.
+_load_settings() {
+    # Unreadable (e.g. non-root running 'paqctl help') is not an error
+    [ -r "$INSTALL_DIR/settings.conf" ] || return 0
+    local _only=" $* " key value
+    while IFS='=' read -r key value; do
+        [[ "$key" =~ ^[A-Z_][A-Z_0-9]*$ ]] || continue
+        [ $# -eq 0 ] || [[ "$_only" == *" $key "* ]] || continue
+        value="${value#\"}"; value="${value%\"}"
+        # Skip values with dangerous shell characters
+        [[ "$value" =~ [\`\$\(] ]] && continue
+        case "$key" in
+            BACKEND) BACKEND="$value" ;;
+            ROLE) ROLE="$value" ;;
+            PAQET_VERSION) PAQET_VERSION="$value" ;;
+            PAQCTL_VERSION) PAQCTL_VERSION="$value" ;;
+            LISTEN_PORT) [[ "$value" =~ ^[0-9]*$ ]] && LISTEN_PORT="$value" ;;
+            SOCKS_PORT) [[ "$value" =~ ^[0-9]*$ ]] && SOCKS_PORT="$value" ;;
+            INTERFACE) INTERFACE="$value" ;;
+            LOCAL_IP) LOCAL_IP="$value" ;;
+            GATEWAY_MAC) GATEWAY_MAC="$value" ;;
+            ENCRYPTION_KEY) ENCRYPTION_KEY="$value" ;;
+            PAQET_TCP_LOCAL_FLAG) [[ "$value" =~ ^[FSRPAUEC]+(,[FSRPAUEC]+)*$ ]] && PAQET_TCP_LOCAL_FLAG="$value" ;;
+            PAQET_TCP_REMOTE_FLAG) [[ "$value" =~ ^[FSRPAUEC]+(,[FSRPAUEC]+)*$ ]] && PAQET_TCP_REMOTE_FLAG="$value" ;;
+            REMOTE_SERVER) REMOTE_SERVER="$value" ;;
+            GFK_VIO_PORT) [[ "$value" =~ ^[0-9]*$ ]] && GFK_VIO_PORT="$value" ;;
+            GFK_VIO_CLIENT_PORT) [[ "$value" =~ ^[0-9]*$ ]] && GFK_VIO_CLIENT_PORT="$value" ;;
+            GFK_QUIC_PORT) [[ "$value" =~ ^[0-9]*$ ]] && GFK_QUIC_PORT="$value" ;;
+            GFK_QUIC_CLIENT_PORT) [[ "$value" =~ ^[0-9]*$ ]] && GFK_QUIC_CLIENT_PORT="$value" ;;
+            GFK_AUTH_CODE) GFK_AUTH_CODE="$value" ;;
+            GFK_PORT_MAPPINGS) GFK_PORT_MAPPINGS="$value" ;;
+            GFK_SOCKS_PORT) [[ "$value" =~ ^[0-9]*$ ]] && GFK_SOCKS_PORT="$value" ;;
+            GFK_SOCKS_VIO_PORT) [[ "$value" =~ ^[0-9]*$ ]] && GFK_SOCKS_VIO_PORT="$value" ;;
+            XRAY_PANEL_DETECTED) XRAY_PANEL_DETECTED="$value" ;;
+            MICROSOCKS_PORT) [[ "$value" =~ ^[0-9]*$ ]] && MICROSOCKS_PORT="$value" ;;
+            GFK_SERVER_IP) GFK_SERVER_IP="$value" ;;
+            GFK_TCP_FLAGS) [[ "$value" =~ ^[FSRPAUEC]+$ ]] && GFK_TCP_FLAGS="$value" ;;
+            TELEGRAM_BOT_TOKEN) TELEGRAM_BOT_TOKEN="$value" ;;
+            TELEGRAM_CHAT_ID) TELEGRAM_CHAT_ID="$value" ;;
+            TELEGRAM_INTERVAL) [[ "$value" =~ ^[0-9]+$ ]] && TELEGRAM_INTERVAL="$value" ;;
+            TELEGRAM_ENABLED) TELEGRAM_ENABLED="$value" ;;
+            TELEGRAM_ALERTS_ENABLED) TELEGRAM_ALERTS_ENABLED="$value" ;;
+            TELEGRAM_DAILY_SUMMARY) TELEGRAM_DAILY_SUMMARY="$value" ;;
+            TELEGRAM_WEEKLY_SUMMARY) TELEGRAM_WEEKLY_SUMMARY="$value" ;;
+            TELEGRAM_SERVER_LABEL) TELEGRAM_SERVER_LABEL="$value" ;;
+            TELEGRAM_START_HOUR) [[ "$value" =~ ^[0-9]+$ ]] && TELEGRAM_START_HOUR="$value" ;;
+            ROUTING_MODE) ROUTING_MODE="$value" ;;
+            FORWARD_PORT) FORWARD_PORT="$value" ;;
+            FORWARD_TARGET) FORWARD_TARGET="$value" ;;
+            KCP_PROFILE) KCP_PROFILE="$value" ;;
+            KCP_CONN) KCP_CONN="$value" ;;
+            KCP_MTU) KCP_MTU="$value" ;;
+            KCP_SNDWND) KCP_SNDWND="$value" ;;
+            KCP_RCVWND) KCP_RCVWND="$value" ;;
+            KCP_NODELAY) KCP_NODELAY="$value" ;;
+            KCP_INTERVAL) KCP_INTERVAL="$value" ;;
+            KCP_RESEND) KCP_RESEND="$value" ;;
+            KCP_NOCONGESTION) KCP_NOCONGESTION="$value" ;;
+            KCP_SOCKBUF) KCP_SOCKBUF="$value" ;;
+            KCP_SMUXBUF) KCP_SMUXBUF="$value" ;;
+            TURBO_ENABLED) TURBO_ENABLED="$value" ;;
+            WATCHDOG_ENABLED) WATCHDOG_ENABLED="$value" ;;
+        esac
+    done < <(grep '^[A-Z_][A-Z_0-9]*=' "$INSTALL_DIR/settings.conf")
 }
 
-_validate_mac() { [[ "$1" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; }
-
-_validate_iface() { [[ "$1" =~ ^[a-zA-Z0-9._-]+$ ]] && [ ${#1} -le 64 ]; }
-
-_validate_version_tag() {
-    [[ "$1" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?$ ]]
-}
-
-#═══════════════════════════════════════════════════════════════════════
-# Binary Download & Install
-#═══════════════════════════════════════════════════════════════════════
-
-# Retry helper with exponential backoff for API requests
-_curl_with_retry() {
-    local url="$1"
-    local max_attempts="${2:-3}"
-    local attempt=1
-    local delay=2
-    local response=""
-    while [ $attempt -le $max_attempts ]; do
-        response=$(curl -s --max-time 15 "$url" 2>/dev/null)
-        if [ -n "$response" ]; then
-            # Check for rate limit response
-            if echo "$response" | grep -q '"message".*rate limit'; then
-                log_warn "GitHub API rate limited, waiting ${delay}s (attempt $attempt/$max_attempts)"
-                sleep $delay
-                delay=$((delay * 2))
-                attempt=$((attempt + 1))
-                continue
-            fi
-            echo "$response"
-            return 0
-        fi
-        [ $attempt -lt $max_attempts ] && sleep $delay
-        delay=$((delay * 2))
-        attempt=$((attempt + 1))
-    done
-    return 1
-}
-
-get_latest_version() {
-    local response
-    response=$(_curl_with_retry "$PAQET_API_URL" 3)
-    if [ -z "$response" ]; then
-        log_error "Failed to query GitHub API after retries"
+# Write settings.conf atomically from the current shell variables.
+save_settings() {
+    local _tg_token="${TELEGRAM_BOT_TOKEN:-}"
+    local _tg_chat="${TELEGRAM_CHAT_ID:-}"
+    local _tg_interval="${TELEGRAM_INTERVAL:-6}"
+    local _tg_enabled="${TELEGRAM_ENABLED:-false}"
+    local _tg_alerts="${TELEGRAM_ALERTS_ENABLED:-true}"
+    local _tg_daily="${TELEGRAM_DAILY_SUMMARY:-true}"
+    local _tg_weekly="${TELEGRAM_WEEKLY_SUMMARY:-true}"
+    local _tg_label="${TELEGRAM_SERVER_LABEL:-}"
+    local _tg_start_hour="${TELEGRAM_START_HOUR:-0}"
+    # Sanitize sensitive values - remove shell metacharacters and control chars
+    _sanitize_value() {
+        printf '%s' "$1" | tr -d '"$`\\'\''(){}[]<>|;&!\n\r\t'
+    }
+    local _safe_key; _safe_key=$(_sanitize_value "${ENCRYPTION_KEY:-}")
+    local _safe_auth; _safe_auth=$(_sanitize_value "${GFK_AUTH_CODE:-}")
+    local _tmp
+    _tmp=$(mktemp "$INSTALL_DIR/settings.conf.XXXXXXXX") || { log_error "Failed to create temp file"; return 1; }
+    (umask 077; cat > "$_tmp" << SEOF
+BACKEND="${BACKEND:-paqet}"
+ROLE="${ROLE}"
+PAQET_VERSION="${PAQET_VERSION:-unknown}"
+PAQCTL_VERSION="${VERSION}"
+LISTEN_PORT="${LISTEN_PORT:-}"
+SOCKS_PORT="${SOCKS_PORT:-}"
+INTERFACE="${INTERFACE:-${IFACE:-}}"
+LOCAL_IP="${LOCAL_IP:-}"
+GATEWAY_MAC="${GATEWAY_MAC:-${GW_MAC:-}}"
+ENCRYPTION_KEY="${_safe_key}"
+PAQET_TCP_LOCAL_FLAG="${PAQET_TCP_LOCAL_FLAG:-PA}"
+PAQET_TCP_REMOTE_FLAG="${PAQET_TCP_REMOTE_FLAG:-PA}"
+REMOTE_SERVER="${REMOTE_SERVER:-}"
+GFK_VIO_PORT="${GFK_VIO_PORT:-}"
+GFK_VIO_CLIENT_PORT="${GFK_VIO_CLIENT_PORT:-}"
+GFK_QUIC_PORT="${GFK_QUIC_PORT:-}"
+GFK_QUIC_CLIENT_PORT="${GFK_QUIC_CLIENT_PORT:-}"
+GFK_AUTH_CODE="${_safe_auth}"
+GFK_PORT_MAPPINGS="${GFK_PORT_MAPPINGS:-}"
+GFK_SOCKS_PORT="${GFK_SOCKS_PORT:-}"
+GFK_SOCKS_VIO_PORT="${GFK_SOCKS_VIO_PORT:-}"
+XRAY_PANEL_DETECTED="${XRAY_PANEL_DETECTED:-false}"
+MICROSOCKS_PORT="${MICROSOCKS_PORT:-}"
+GFK_SERVER_IP="${GFK_SERVER_IP:-}"
+GFK_TCP_FLAGS="${GFK_TCP_FLAGS:-AP}"
+TELEGRAM_BOT_TOKEN="${_tg_token}"
+TELEGRAM_CHAT_ID="${_tg_chat}"
+TELEGRAM_INTERVAL=${_tg_interval}
+TELEGRAM_ENABLED=${_tg_enabled}
+TELEGRAM_ALERTS_ENABLED=${_tg_alerts}
+TELEGRAM_DAILY_SUMMARY=${_tg_daily}
+TELEGRAM_WEEKLY_SUMMARY=${_tg_weekly}
+TELEGRAM_SERVER_LABEL="${_tg_label}"
+TELEGRAM_START_HOUR=${_tg_start_hour}
+ROUTING_MODE="${ROUTING_MODE:-socks5}"
+FORWARD_PORT="${FORWARD_PORT:-14000}"
+FORWARD_TARGET="${FORWARD_TARGET:-127.0.0.1:80}"
+KCP_PROFILE="${KCP_PROFILE:-standard}"
+KCP_CONN="${KCP_CONN:-2}"
+KCP_MTU="${KCP_MTU:-1350}"
+KCP_SNDWND="${KCP_SNDWND:-1024}"
+KCP_RCVWND="${KCP_RCVWND:-1024}"
+KCP_NODELAY="${KCP_NODELAY:-0}"
+KCP_INTERVAL="${KCP_INTERVAL:-20}"
+KCP_RESEND="${KCP_RESEND:-2}"
+KCP_NOCONGESTION="${KCP_NOCONGESTION:-0}"
+KCP_SOCKBUF="${KCP_SOCKBUF:-4194304}"
+KCP_SMUXBUF="${KCP_SMUXBUF:-4194304}"
+TURBO_ENABLED="${TURBO_ENABLED:-false}"
+WATCHDOG_ENABLED="${WATCHDOG_ENABLED:-false}"
+SEOF
+    )
+    if ! mv "$_tmp" "$INSTALL_DIR/settings.conf"; then
+        log_error "Failed to save settings"
+        rm -f "$_tmp"
         return 1
     fi
-    local tag
-    tag=$(echo "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | grep -o '"[^"]*"$' | tr -d '"')
-    if [ -z "$tag" ]; then
-        log_error "Could not determine latest paqet version"
-        return 1
-    fi
-    if ! _validate_version_tag "$tag"; then
-        log_error "Invalid version tag format: $tag"
-        return 1
-    fi
-    echo "$tag"
+    chmod 600 "$INSTALL_DIR/settings.conf" 2>/dev/null
 }
+# shellcheck shell=bash
+# Backend install/config helpers (paqet binary, GFW-knocker scripts).
+# Included into both the installer and the management script by build.sh.
+
+#═══════════════════════════════════════════════════════════════════════
+# paqet binary
+#═══════════════════════════════════════════════════════════════════════
 
 download_paqet() {
     local version="$1"
     local arch
-    arch=$(detect_arch)
+    arch=$(detect_arch) || return 1
     local os_name="linux"
     local ext="tar.gz"
     local filename="paqet-${os_name}-${arch}-${version}.${ext}"
@@ -512,76 +610,816 @@ download_paqet() {
 }
 
 #═══════════════════════════════════════════════════════════════════════
-# Network Auto-Detection
+# GFW-knocker
 #═══════════════════════════════════════════════════════════════════════
 
-detect_network() {
-    log_info "Auto-detecting network configuration..."
-
-    # Default interface - handle both standard "via X dev Y" and OpenVZ "dev Y scope link" formats
-    # Standard: "default via 192.168.1.1 dev eth0" -> $5 = eth0
-    # OpenVZ:   "default dev venet0 scope link"   -> $3 = venet0
-    local _route_line
-    _route_line=$(ip route show default 2>/dev/null | head -1)
-    if [[ "$_route_line" == *" via "* ]]; then
-        # Standard format with gateway
-        DETECTED_IFACE=$(echo "$_route_line" | awk '{print $5}')
-    elif [[ "$_route_line" == *" dev "* ]]; then
-        # OpenVZ/direct format without gateway
-        DETECTED_IFACE=$(echo "$_route_line" | awk '{print $3}')
+install_python_deps() {
+    log_info "Installing Python dependencies for GFW-knocker..."
+    _ensure_pkg_manager
+    if ! command -v python3 &>/dev/null; then
+        install_package python3
+    fi
+    # Ensure python3 version >= 3.10
+    local pyver
+    pyver=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0.0")
+    local pymajor pyminor
+    pymajor=$(echo "$pyver" | cut -d. -f1)
+    pyminor=$(echo "$pyver" | cut -d. -f2)
+    if [ "$pymajor" -lt 3 ] || { [ "$pymajor" -eq 3 ] && [ "$pyminor" -lt 10 ]; }; then
+        log_error "Python 3.10+ required, found $pyver"
+        return 1
     fi
 
-    # Validate detected interface exists
-    if [ -n "$DETECTED_IFACE" ] && ! ip link show "$DETECTED_IFACE" &>/dev/null; then
-        DETECTED_IFACE=""
+    # Install venv support (varies by distro)
+    # - Debian/Ubuntu: needs python3-venv or python3.X-venv package
+    # - Fedora/RHEL/Arch/openSUSE: venv included with python3, just need pip
+    # - Alpine: needs py3-pip
+    case "$PKG_MANAGER" in
+        apt)
+            # Debian/Ubuntu needs python3-venv package (version-specific)
+            local pyver_full
+            pyver_full=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
+            if [ -n "$pyver_full" ]; then
+                install_package "python${pyver_full}-venv" || install_package "python3-venv"
+            else
+                install_package "python3-venv"
+            fi
+            ;;
+        dnf)
+            # Fedora/RHEL 8+: venv is included with python3, just ensure pip
+            install_package "python3-pip" || true
+            ;;
+        yum)
+            # Older RHEL/CentOS 7
+            install_package "python3-pip" || true
+            ;;
+        pacman)
+            # Arch Linux: venv included with python, pip is separate
+            install_package "python-pip" || true
+            ;;
+        zypper)
+            # openSUSE: venv included with python3
+            install_package "python3-pip" || true
+            ;;
+        apk)
+            # Alpine
+            install_package "py3-pip" || true
+            ;;
+        *)
+            # Try generic python3-venv, ignore if fails (venv may be built-in)
+            install_package "python3-venv" 2>/dev/null || true
+            ;;
+    esac
+
+    # Create virtual environment
+    local VENV_DIR="$INSTALL_DIR/venv"
+    # Check if venv exists AND is complete (has pip)
+    if [ ! -x "$VENV_DIR/bin/pip" ]; then
+        # Remove broken/incomplete venv if exists
+        [ -d "$VENV_DIR" ] && rm -rf "$VENV_DIR"
+        log_info "Creating Python virtual environment..."
+        python3 -m venv "$VENV_DIR" || {
+            log_error "Failed to create virtual environment (is python3-venv installed?)"
+            return 1
+        }
     fi
 
-    if [ -z "$DETECTED_IFACE" ]; then
-        # Skip loopback, docker, veth, bridge, and other virtual interfaces
-        # Note: grep -v returns exit 1 if no matches, so we add || true for pipefail
-        DETECTED_IFACE=$(ip -o link show 2>/dev/null | awk -F': ' '{gsub(/ /,"",$2); print $2}' | { grep -vE '^(lo|docker[0-9]|br-|veth|virbr|tun|tap|wg)' || true; } | head -1)
+    # Verify pip exists after venv creation
+    if [ ! -x "$VENV_DIR/bin/pip" ]; then
+        log_error "venv created but pip missing (install python3-venv package)"
+        return 1
     fi
 
-    # Local IP - wrap entire pipeline to prevent pipefail exit
-    if [ -n "$DETECTED_IFACE" ]; then
-        # Note: wrap in subshell with || true to handle cases where interface is invalid or has no IP
-        DETECTED_IP=$( (ip -4 addr show "$DETECTED_IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | { grep -o '[0-9.]*' || true; } | head -1) || true )
-    fi
-    if [ -z "$DETECTED_IP" ]; then
-        DETECTED_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-        [ -z "$DETECTED_IP" ] && DETECTED_IP=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{gsub(/\/.*/, "", $2); print $2; exit}')
-    fi
+    # Install packages in venv
+    log_info "Installing scapy and aioquic in venv..."
+    "$VENV_DIR/bin/pip" install --quiet --upgrade pip 2>/dev/null || true
+    "$VENV_DIR/bin/pip" install --quiet scapy aioquic 2>/dev/null || {
+        # Try with --break-system-packages as fallback (shouldn't be needed in venv)
+        "$VENV_DIR/bin/pip" install scapy aioquic || {
+            log_error "Failed to install Python packages (scapy, aioquic)"
+            return 1
+        }
+    }
 
-    # Gateway IP - only present in standard "via X" format, not in OpenVZ
-    if [[ "$_route_line" == *" via "* ]]; then
-        DETECTED_GATEWAY=$(echo "$_route_line" | awk '{print $3}')
+    # Verify
+    if "$VENV_DIR/bin/python" -c "import scapy; import aioquic" 2>/dev/null; then
+        log_success "Python dependencies installed (scapy, aioquic)"
     else
-        DETECTED_GATEWAY=""
+        log_error "Python package verification failed"
+        return 1
     fi
-
-    # Gateway MAC
-    DETECTED_GW_MAC=""
-    if [ -n "$DETECTED_GATEWAY" ]; then
-        # Try ip neigh first (most reliable on Linux)
-        DETECTED_GW_MAC=$(ip neigh show "$DETECTED_GATEWAY" 2>/dev/null | awk '/lladdr/{print $5; exit}')
-        if [ -z "$DETECTED_GW_MAC" ]; then
-            # Trigger ARP resolution
-            ping -c 1 -W 2 "$DETECTED_GATEWAY" &>/dev/null || true
-            sleep 1
-            DETECTED_GW_MAC=$(ip neigh show "$DETECTED_GATEWAY" 2>/dev/null | awk '/lladdr/{print $5; exit}')
-        fi
-        if [ -z "$DETECTED_GW_MAC" ] && command -v arp &>/dev/null; then
-            # Fallback: parse arp output looking for MAC pattern
-            # Note: grep returns exit 1 if no matches, so we add || true for pipefail
-            DETECTED_GW_MAC=$(arp -n "$DETECTED_GATEWAY" 2>/dev/null | { grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' || true; } | head -1)
-        fi
-    fi
-
-    log_info "Interface: ${DETECTED_IFACE:-unknown}"
-    log_info "Local IP:  ${DETECTED_IP:-unknown}"
-    log_info "Gateway:   ${DETECTED_GATEWAY:-unknown}"
-    log_info "GW MAC:    ${DETECTED_GW_MAC:-unknown}"
 }
+
+install_microsocks() {
+    log_info "Installing microsocks for SOCKS5 proxy..."
+    if [ -x "$INSTALL_DIR/bin/microsocks" ]; then
+        log_success "microsocks already installed"
+        return 0
+    fi
+    # Build dependencies
+    command -v gcc &>/dev/null || install_package gcc
+    command -v make &>/dev/null || install_package make
+    _ensure_pkg_manager
+    # Alpine needs the libc headers to compile
+    [ "$PKG_MANAGER" = "apk" ] && { [ -f /usr/include/stdio.h ] || install_package musl-dev || true; }
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    if ! curl -sL "https://github.com/${MICROSOCKS_REPO}/archive/refs/heads/master.tar.gz" -o "$tmp_dir/microsocks.tar.gz"; then
+        log_error "Failed to download microsocks"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    tar -xzf "$tmp_dir/microsocks.tar.gz" -C "$tmp_dir" 2>/dev/null || {
+        log_error "Failed to extract microsocks"
+        rm -rf "$tmp_dir"
+        return 1
+    }
+    local src_dir
+    src_dir=$(find "$tmp_dir" -maxdepth 1 -type d -name "microsocks*" | head -1)
+    if [ -z "$src_dir" ]; then
+        log_error "microsocks source directory not found"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    if ! make -C "$src_dir" -j"$(nproc 2>/dev/null || echo 1)" 2>/dev/null; then
+        log_error "Failed to compile microsocks"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    mkdir -p "$INSTALL_DIR/bin"
+    cp "$src_dir/microsocks" "$INSTALL_DIR/bin/microsocks"
+    chmod 755 "$INSTALL_DIR/bin/microsocks"
+    rm -rf "$tmp_dir"
+    log_success "microsocks installed"
+}
+
+download_gfk() {
+    log_info "Downloading GFW-knocker scripts..."
+    if ! mkdir -p "$GFK_DIR"; then
+        log_error "Failed to create $GFK_DIR"
+        return 1
+    fi
+    # Note: parameters.py is generated by generate_gfk_config(), don't download it
+    # Download server scripts from gfk/server/
+    local server_files="mainserver.py quic_server.py vio_server.py"
+    local f
+    for f in $server_files; do
+        if ! curl -sL "$GFK_RAW_URL/server/$f" -o "$GFK_DIR/$f"; then
+            log_error "Failed to download $f"
+            return 1
+        fi
+    done
+    # Download client scripts from gfk/client/
+    local client_files="mainclient.py quic_client.py vio_client.py"
+    for f in $client_files; do
+        if ! curl -sL "$GFK_RAW_URL/client/$f" -o "$GFK_DIR/$f"; then
+            log_error "Failed to download $f"
+            return 1
+        fi
+    done
+    chmod 600 "$GFK_DIR"/*.py
+    # Patch mainserver.py to use venv python for subprocesses
+    if [ -f "$GFK_DIR/mainserver.py" ]; then
+        sed -i "s|'python3'|'$INSTALL_DIR/venv/bin/python'|g" "$GFK_DIR/mainserver.py"
+    fi
+    log_success "GFW-knocker scripts downloaded to $GFK_DIR"
+}
+
+generate_gfk_certs() {
+    if [ -f "$GFK_DIR/cert.pem" ] && [ -f "$GFK_DIR/key.pem" ]; then
+        log_info "GFW-knocker certificates already exist"
+        return 0
+    fi
+    if ! command -v openssl &>/dev/null; then
+        log_info "Installing openssl..."
+        install_package openssl || { log_error "Failed to install openssl"; return 1; }
+    fi
+    log_info "Generating QUIC TLS certificates..."
+    if ! openssl req -x509 -newkey rsa:2048 -keyout "$GFK_DIR/key.pem" \
+        -out "$GFK_DIR/cert.pem" -days 3650 -nodes -subj "/CN=gfk" 2>/dev/null; then
+        log_error "Failed to generate certificates"
+        return 1
+    fi
+    chmod 600 "$GFK_DIR/key.pem" "$GFK_DIR/cert.pem"
+    log_success "QUIC certificates generated"
+}
+
+generate_gfk_config() {
+    log_info "Generating GFW-knocker configuration..."
+    # Ensure GFK directory exists
+    mkdir -p "$GFK_DIR" || { log_error "Failed to create $GFK_DIR"; return 1; }
+    local _tmp
+    _tmp=$(mktemp "$GFK_DIR/parameters.py.XXXXXXXX") || { log_error "Failed to create temp file"; return 1; }
+
+    # Determine port values based on role - validate they are numeric
+    local vio_tcp_server_port="${GFK_VIO_PORT:-45000}"
+    local vio_tcp_client_port="${GFK_VIO_CLIENT_PORT:-40000}"
+    local vio_udp_server_port="${GFK_VIO_UDP_SERVER:-35000}"
+    local vio_udp_client_port="${GFK_VIO_UDP_CLIENT:-30000}"
+    local quic_server_port="${GFK_QUIC_PORT:-25000}"
+    local quic_client_port="${GFK_QUIC_CLIENT_PORT:-20000}"
+
+    # Validate all ports are numeric
+    for _p in "$vio_tcp_server_port" "$vio_tcp_client_port" "$vio_udp_server_port" \
+              "$vio_udp_client_port" "$quic_server_port" "$quic_client_port"; do
+        if ! [[ "$_p" =~ ^[0-9]+$ ]]; then
+            log_error "Invalid port number: $_p"
+            rm -f "$_tmp"
+            return 1
+        fi
+    done
+
+    # Escape Python string - prevents code injection
+    _escape_py_string() {
+        local s="$1"
+        s="${s//\\/\\\\}"   # Escape backslashes first
+        s="${s//\"/\\\"}"   # Escape double quotes
+        s="${s//\'/\\\'}"   # Escape single quotes
+        s="${s//$'\n'/\\n}" # Escape newlines
+        s="${s//$'\r'/\\r}" # Escape carriage returns
+        printf '%s' "$s"
+    }
+
+    # Validate and escape server IP
+    local safe_server_ip
+    safe_server_ip=$(_escape_py_string "${GFK_SERVER_IP:-}")
+    if ! _validate_ip "${GFK_SERVER_IP:-}"; then
+        log_error "Invalid server IP: ${GFK_SERVER_IP:-}"
+        rm -f "$_tmp"
+        return 1
+    fi
+
+    # Validate and escape auth code
+    local safe_auth_code
+    safe_auth_code=$(_escape_py_string "${GFK_AUTH_CODE:-}")
+
+    # Build port mapping dict string with validation
+    local tcp_mapping="${GFK_PORT_MAPPINGS:-14000:443}"
+    local mapping_str="{"
+    local first=true
+    local pair
+    for pair in $(echo "$tcp_mapping" | tr ',' ' '); do
+        local lport rport
+        lport=$(echo "$pair" | cut -d: -f1)
+        rport=$(echo "$pair" | cut -d: -f2)
+        # Validate both ports are numeric
+        if ! [[ "$lport" =~ ^[0-9]+$ ]] || ! [[ "$rport" =~ ^[0-9]+$ ]]; then
+            log_error "Invalid port mapping: $pair (must be numeric:numeric)"
+            rm -f "$_tmp"
+            return 1
+        fi
+        if [ "$first" = true ]; then
+            mapping_str="${mapping_str}${lport}: ${rport}"
+            first=false
+        else
+            mapping_str="${mapping_str}, ${lport}: ${rport}"
+        fi
+    done
+    mapping_str="${mapping_str}}"
+
+    # Escape GFK_DIR for Python string
+    local safe_gfk_dir
+    safe_gfk_dir=$(_escape_py_string "${GFK_DIR}")
+
+    (
+    umask 077
+    cat > "$_tmp" << PYEOF
+# GFW-knocker parameters - auto-generated by paqctl
+# Do not edit manually
+
+vps_ip = "${safe_server_ip}"
+xray_server_ip_address = "127.0.0.1"
+
+tcp_port_mapping = ${mapping_str}
+udp_port_mapping = {}
+
+vio_tcp_server_port = ${vio_tcp_server_port}
+vio_tcp_client_port = ${vio_tcp_client_port}
+vio_udp_server_port = ${vio_udp_server_port}
+vio_udp_client_port = ${vio_udp_client_port}
+
+quic_server_port = ${quic_server_port}
+quic_client_port = ${quic_client_port}
+quic_local_ip = "127.0.0.1"
+
+quic_idle_timeout = 86400
+udp_timeout = 300
+quic_mtu = ${KCP_MTU:-1350}
+quic_verify_cert = False
+quic_max_data = 1073741824
+quic_max_stream_data = 1073741824
+
+quic_auth_code = "${safe_auth_code}"
+
+quic_cert_filepath = ("${safe_gfk_dir}/cert.pem", "${safe_gfk_dir}/key.pem")
+
+tcp_flags = "${GFK_TCP_FLAGS:-AP}"
+PYEOF
+    )
+    if ! mv "$_tmp" "$GFK_DIR/parameters.py"; then
+        log_error "Failed to save GFW-knocker configuration"
+        rm -f "$_tmp"
+        return 1
+    fi
+    chmod 600 "$GFK_DIR/parameters.py"
+    log_success "GFW-knocker configuration saved"
+}
+
+create_gfk_client_wrapper() {
+    log_info "Creating GFW-knocker client wrapper..."
+    local wrapper="$INSTALL_DIR/bin/gfk-client.sh"
+    mkdir -p "$INSTALL_DIR/bin"
+    cat > "$wrapper" << 'WRAPEOF'
+#!/bin/bash
+set -e
+GFK_DIR="REPLACE_ME_GFK_DIR"
+INSTALL_DIR="REPLACE_ME_INSTALL_DIR"
+
+cd "$GFK_DIR"
+"$INSTALL_DIR/venv/bin/python" mainclient.py &
+PID1=$!
+trap "kill $PID1 2>/dev/null; wait" EXIT INT TERM
+wait
+WRAPEOF
+    sed "s#REPLACE_ME_GFK_DIR#${GFK_DIR}#g; s#REPLACE_ME_INSTALL_DIR#${INSTALL_DIR}#g" "$wrapper" > "$wrapper.sed" && mv "$wrapper.sed" "$wrapper"
+    chmod 755 "$wrapper"
+    log_success "Client wrapper created at $wrapper"
+}
+# shellcheck shell=bash
+# Xray (SOCKS5 for the GFK server).
+# Included into both the installer and the management script by build.sh.
+
+#═══════════════════════════════════════════════════════════════════════
+# Xray
+#═══════════════════════════════════════════════════════════════════════
+
+XRAY_CONFIG_DIR="/usr/local/etc/xray"
+XRAY_CONFIG_FILE="$XRAY_CONFIG_DIR/config.json"
+
+check_xray_installed() {
+    command -v xray &>/dev/null && return 0
+    [ -x /usr/local/bin/xray ] && return 0
+    [ -x /usr/local/x-ui/bin/xray-linux-amd64 ] && return 0
+    return 1
+}
+
+install_xray() {
+    if check_xray_installed; then
+        log_info "Xray is already installed"
+        return 0
+    fi
+
+    log_info "Installing Xray ${XRAY_VERSION_PINNED}..."
+
+    # Use official Xray install script with pinned version for stability
+    local tmp_script
+    tmp_script=$(mktemp)
+    if ! curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$tmp_script"; then
+        log_error "Failed to download Xray installer"
+        rm -f "$tmp_script"
+        return 1
+    fi
+
+    # Install specific version (not latest) for stability
+    if ! bash "$tmp_script" install --version "$XRAY_VERSION_PINNED" 2>/dev/null; then
+        log_error "Failed to install Xray"
+        rm -f "$tmp_script"
+        return 1
+    fi
+    rm -f "$tmp_script"
+
+    log_success "Xray ${XRAY_VERSION_PINNED} installed"
+}
+
+configure_xray_socks() {
+    local listen_port="${1:-443}"
+
+    log_info "Configuring Xray SOCKS5 proxy on port $listen_port..."
+
+    mkdir -p "$XRAY_CONFIG_DIR"
+
+    # Create simple SOCKS5 inbound config
+    cat > "$XRAY_CONFIG_FILE" << EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "port": ${listen_port},
+      "listen": "127.0.0.1",
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {}
+    }
+  ]
+}
+EOF
+    chmod 644 "$XRAY_CONFIG_FILE"  # Xray service runs as 'nobody', needs read access
+    log_success "Xray configured (SOCKS5 on 127.0.0.1:$listen_port)"
+}
+
+# Check if running xray is paqctl's own standalone install (not a real panel)
+# Returns 0 if standalone (all inbounds are socks on 127.0.0.1), 1 if panel
+_is_paqctl_standalone_xray() {
+    [ -f "$XRAY_CONFIG_FILE" ] || return 1
+    command -v python3 &>/dev/null || return 1
+    python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    inbounds = cfg.get('inbounds', [])
+    if not inbounds:
+        sys.exit(1)
+    for i in inbounds:
+        if i.get('protocol') != 'socks' or i.get('listen', '0.0.0.0') != '127.0.0.1':
+            sys.exit(1)
+    sys.exit(0)
+except:
+    sys.exit(1)
+" "$XRAY_CONFIG_FILE" 2>/dev/null
+}
+
+# Add a SOCKS5 inbound to an existing xray config (panel) without touching other inbounds
+_add_xray_gfk_socks() {
+    local port="$1"
+    python3 -c "
+import json, sys
+port = int(sys.argv[1])
+config_path = sys.argv[2]
+try:
+    with open(config_path, 'r') as f:
+        cfg = json.load(f)
+except:
+    cfg = {'inbounds': [], 'outbounds': [{'tag': 'direct', 'protocol': 'freedom', 'settings': {}}]}
+cfg.setdefault('inbounds', [])
+cfg['inbounds'] = [i for i in cfg['inbounds'] if i.get('tag') != 'gfk-socks']
+cfg['inbounds'].append({
+    'tag': 'gfk-socks',
+    'port': port,
+    'listen': '127.0.0.1',
+    'protocol': 'socks',
+    'settings': {'auth': 'noauth', 'udp': True},
+    'sniffing': {'enabled': True, 'destOverride': ['http', 'tls']}
+})
+if not any(o.get('protocol') == 'freedom' for o in cfg.get('outbounds', [])):
+    cfg.setdefault('outbounds', []).append({'tag': 'direct', 'protocol': 'freedom', 'settings': {}})
+with open(config_path, 'w') as f:
+    json.dump(cfg, f, indent=2)
+" "$port" "$XRAY_CONFIG_FILE" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        log_error "Failed to add SOCKS5 inbound to existing Xray config"
+        return 1
+    fi
+    log_success "Added GFK SOCKS5 inbound on 127.0.0.1:$port"
+}
+
+start_xray() {
+    log_info "Starting Xray service..."
+
+    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
+        # Stop first, reload daemon, then start - with retry
+        systemctl stop xray 2>/dev/null || true
+        sleep 1
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable xray 2>/dev/null || true
+
+        # Try up to 3 times
+        local attempt
+        for attempt in 1 2 3; do
+            systemctl start xray 2>/dev/null
+            sleep 2
+            if systemctl is-active --quiet xray; then
+                log_success "Xray started"
+                return 0
+            fi
+            [ "$attempt" -lt 3 ] && sleep 1
+        done
+        log_error "Failed to start Xray after 3 attempts"
+        return 1
+    else
+        # Direct start for non-systemd
+        local _xray_bin=""
+        [ -x /usr/local/bin/xray ] && _xray_bin="/usr/local/bin/xray"
+        [ -z "$_xray_bin" ] && [ -x /usr/local/x-ui/bin/xray-linux-amd64 ] && _xray_bin="/usr/local/x-ui/bin/xray-linux-amd64"
+        if [ -n "$_xray_bin" ]; then
+            pkill -x xray 2>/dev/null || true
+            sleep 1
+            nohup "$_xray_bin" run -c "$XRAY_CONFIG_FILE" > /var/log/xray.log 2>&1 &
+            sleep 2
+            if pgrep -f "xray" &>/dev/null; then
+                log_success "Xray started"
+                return 0
+            fi
+        fi
+        log_error "Failed to start Xray"
+        return 1
+    fi
+}
+
+stop_xray() {
+    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
+        systemctl stop xray 2>/dev/null || true
+    else
+        pkill -x xray 2>/dev/null || true
+    fi
+}
+
+setup_xray_for_gfk() {
+    local target_port
+    target_port=$(echo "${GFK_PORT_MAPPINGS:-14000:443}" | cut -d: -f2 | cut -d, -f1)
+
+    if pgrep -x xray &>/dev/null || pgrep -f "xray-linux" &>/dev/null; then
+        # Check if this is paqctl's own standalone Xray (not a real panel)
+        if _is_paqctl_standalone_xray; then
+            log_info "Existing Xray is paqctl's standalone install — reconfiguring..."
+            stop_xray
+            sleep 1
+            # Fall through to standalone install path below
+        else
+            XRAY_PANEL_DETECTED=true
+            log_info "Existing Xray detected — adding SOCKS5 alongside panel..."
+
+            # Clean up any leftover standalone GFK xray from prior installs
+            pkill -f "xray run -c.*gfk-socks.json" 2>/dev/null || true
+            rm -f "${XRAY_CONFIG_DIR}/gfk-socks.json" 2>/dev/null
+
+            # Check all existing target ports from mappings
+            local mapping pairs
+            IFS=',' read -ra pairs <<< "${GFK_PORT_MAPPINGS:-14000:443}"
+            for mapping in "${pairs[@]}"; do
+                local vio_port="${mapping%%:*}"
+                local tp="${mapping##*:}"
+                if ss -tln 2>/dev/null | grep -q ":${tp} "; then
+                    log_success "Port $tp is listening — GFK will forward VIO port $vio_port to this port"
+                else
+                    log_warn "Port $tp is NOT listening — make sure your panel inbound is on port $tp"
+                fi
+            done
+
+            # Find free port for SOCKS5 (starting at 10443)
+            local socks_port=10443
+            while ss -tln 2>/dev/null | grep -q ":${socks_port} "; do
+                socks_port=$((socks_port + 1))
+                if [ "$socks_port" -gt 65000 ]; then
+                    log_warn "Could not find free port for SOCKS5 — panel-only mode"
+                    echo ""
+                    local first_vio
+                    first_vio=$(echo "${GFK_PORT_MAPPINGS:-14000:443}" | cut -d: -f1 | cut -d, -f1)
+                    log_warn "For panel-to-panel: configure Iran panel outbound to 127.0.0.1:${first_vio}"
+                    return 0
+                fi
+            done
+
+            # Add SOCKS5 inbound to existing xray config
+            _add_xray_gfk_socks "$socks_port" || {
+                log_warn "Could not add SOCKS5 to panel config — panel-only mode"
+                return 0
+            }
+
+            # Restart xray to load new config
+            systemctl restart xray 2>/dev/null || pkill -SIGHUP xray 2>/dev/null || true
+            sleep 2
+
+            # Find next VIO port (highest existing + 1) and append SOCKS5 mapping
+            local max_vio=0
+            for mapping in "${pairs[@]}"; do
+                local v="${mapping%%:*}"
+                [ "$v" -gt "$max_vio" ] && max_vio="$v"
+            done
+            local socks_vio=$((max_vio + 1))
+            GFK_PORT_MAPPINGS="${GFK_PORT_MAPPINGS},${socks_vio}:${socks_port}"
+            GFK_SOCKS_PORT="$socks_port"
+            GFK_SOCKS_VIO_PORT="$socks_vio"
+
+            log_success "SOCKS5 proxy added on port $socks_port (VIO port $socks_vio)"
+            echo ""
+            log_info "Port mappings updated: ${GFK_PORT_MAPPINGS}"
+            log_warn "Use these SAME mappings on the client side"
+            echo ""
+            local first_vio
+            first_vio=$(echo "${GFK_PORT_MAPPINGS:-14000:443}" | cut -d: -f1 | cut -d, -f1)
+            log_warn "For panel-to-panel: configure Iran panel outbound to 127.0.0.1:${first_vio}"
+            log_warn "For direct SOCKS5: use 127.0.0.1:${socks_vio} as your proxy on client"
+            return 0
+        fi
+    fi
+
+    install_xray || return 1
+    configure_xray_socks "$target_port" || return 1
+    start_xray || return 1
+}
+#═══════════════════════════════════════════════════════════════════════
+# Utility Functions
+#═══════════════════════════════════════════════════════════════════════
+
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        log_error "This script must be run as root (use sudo)"
+        exit 1
+    fi
+}
+
+detect_os() {
+    OS="unknown"
+    OS_VERSION="unknown"
+    OS_FAMILY="unknown"
+    HAS_SYSTEMD=false
+    PKG_MANAGER="unknown"
+
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS="$ID"
+        OS_VERSION="${VERSION_ID:-unknown}"
+    elif [ -f /etc/redhat-release ]; then
+        OS="rhel"
+    elif [ -f /etc/debian_version ]; then
+        OS="debian"
+    elif [ -f /etc/alpine-release ]; then
+        OS="alpine"
+    elif [ -f /etc/arch-release ]; then
+        OS="arch"
+    elif [ -f /etc/SuSE-release ] || [ -f /etc/SUSE-brand ]; then
+        OS="opensuse"
+    else
+        OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+    fi
+
+    case "$OS" in
+        ubuntu|debian|linuxmint|pop|elementary|zorin|kali|raspbian)
+            OS_FAMILY="debian"
+            PKG_MANAGER="apt"
+            ;;
+        rhel|centos|fedora|rocky|almalinux|oracle|amazon|amzn)
+            OS_FAMILY="rhel"
+            if command -v dnf &>/dev/null; then
+                PKG_MANAGER="dnf"
+            else
+                PKG_MANAGER="yum"
+            fi
+            ;;
+        arch|manjaro|endeavouros|garuda)
+            OS_FAMILY="arch"
+            PKG_MANAGER="pacman"
+            ;;
+        opensuse|opensuse-leap|opensuse-tumbleweed|sles)
+            OS_FAMILY="suse"
+            PKG_MANAGER="zypper"
+            ;;
+        alpine)
+            OS_FAMILY="alpine"
+            PKG_MANAGER="apk"
+            ;;
+        *)
+            OS_FAMILY="unknown"
+            PKG_MANAGER="unknown"
+            ;;
+    esac
+
+    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
+        HAS_SYSTEMD=true
+    fi
+
+    log_info "Detected: $OS ($OS_FAMILY family), Package manager: $PKG_MANAGER"
+}
+
+check_dependencies() {
+    if [ "$OS_FAMILY" = "alpine" ]; then
+        if ! command -v bash &>/dev/null; then
+            apk add --no-cache bash 2>/dev/null
+        fi
+    fi
+
+    if ! command -v curl &>/dev/null; then
+        install_package curl || log_warn "Could not install curl automatically"
+    fi
+
+    if ! command -v tar &>/dev/null; then
+        install_package tar || log_warn "Could not install tar automatically"
+    fi
+
+    if ! command -v ip &>/dev/null; then
+        case "$PKG_MANAGER" in
+            apt) install_package iproute2 || log_warn "Could not install iproute2" ;;
+            dnf|yum) install_package iproute || log_warn "Could not install iproute" ;;
+            pacman) install_package iproute2 || log_warn "Could not install iproute2" ;;
+            zypper) install_package iproute2 || log_warn "Could not install iproute2" ;;
+            apk) install_package iproute2 || log_warn "Could not install iproute2" ;;
+        esac
+    fi
+
+    if ! command -v tput &>/dev/null; then
+        case "$PKG_MANAGER" in
+            apt) install_package ncurses-bin || log_warn "Could not install ncurses-bin" ;;
+            apk) install_package ncurses || log_warn "Could not install ncurses" ;;
+            *) install_package ncurses || log_warn "Could not install ncurses" ;;
+        esac
+    fi
+
+    # Firewall rules: use firewalld if active, otherwise iptables
+    if _is_firewalld_active; then
+        log_info "firewalld detected — will use firewall-cmd for rules"
+    elif ! command -v iptables &>/dev/null; then
+        log_info "Installing iptables..."
+        case "$PKG_MANAGER" in
+            apt) install_package iptables || log_warn "Could not install iptables - firewall rules may not work" ;;
+            dnf|yum) install_package iptables || log_warn "Could not install iptables" ;;
+            pacman) install_package iptables || log_warn "Could not install iptables" ;;
+            zypper) install_package iptables || log_warn "Could not install iptables" ;;
+            apk) install_package iptables || log_warn "Could not install iptables" ;;
+            *) log_warn "Please install iptables manually for firewall rules to work" ;;
+        esac
+    fi
+
+    # openssl is required for GFK certificate generation
+    if ! command -v openssl &>/dev/null; then
+        install_package openssl || log_warn "Could not install openssl"
+    fi
+
+    # libpcap is required by paqet
+    install_libpcap
+}
+
+install_libpcap() {
+    log_info "Checking for libpcap..."
+
+    # Check if already available
+    if ldconfig -p 2>/dev/null | grep -q libpcap; then
+        log_success "libpcap already installed"
+        return 0
+    fi
+
+    case "$PKG_MANAGER" in
+        apt) install_package libpcap-dev ;;
+        dnf|yum) install_package libpcap-devel ;;
+        pacman) install_package libpcap ;;
+        zypper) install_package libpcap-devel ;;
+        apk) install_package libpcap-dev ;;
+        *) log_warn "Please install libpcap manually for your distribution"; return 1 ;;
+    esac
+
+    # Fedora/RHEL: ensure libpcap.so.1 symlink exists (package may only install versioned .so)
+    if [ "$PKG_MANAGER" = "dnf" ] || [ "$PKG_MANAGER" = "yum" ]; then
+        if ! ldconfig -p 2>/dev/null | grep -q 'libpcap\.so\.1 '; then
+            local _pcap_lib
+            _pcap_lib=$(find /usr/lib64 /usr/lib /lib64 /lib -name 'libpcap.so.*' -type f 2>/dev/null | head -1)
+            if [ -n "$_pcap_lib" ]; then
+                local _libdir
+                _libdir=$(dirname "$_pcap_lib")
+                if [ ! -e "${_libdir}/libpcap.so.1" ]; then
+                    log_info "Creating libpcap.so.1 symlink for Fedora/RHEL compatibility"
+                    ln -sf "$_pcap_lib" "${_libdir}/libpcap.so.1"
+                fi
+                ldconfig 2>/dev/null || true
+            fi
+        fi
+    fi
+}
+
+#═══════════════════════════════════════════════════════════════════════
+# Input Validation Functions
+#═══════════════════════════════════════════════════════════════════════
+#═══════════════════════════════════════════════════════════════════════
+# Binary Download & Install
+#═══════════════════════════════════════════════════════════════════════
+
+get_latest_version() {
+    local response
+    response=$(_curl_with_retry "$PAQET_API_URL" 3)
+    if [ -z "$response" ]; then
+        log_error "Failed to query GitHub API after retries"
+        return 1
+    fi
+    local tag
+    tag=$(echo "$response" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | grep -o '"[^"]*"$' | tr -d '"')
+    if [ -z "$tag" ]; then
+        log_error "Could not determine latest paqet version"
+        return 1
+    fi
+    if ! _validate_version_tag "$tag"; then
+        log_error "Invalid version tag format: $tag"
+        return 1
+    fi
+    echo "$tag"
+}
+#═══════════════════════════════════════════════════════════════════════
+# Network Auto-Detection
+#═══════════════════════════════════════════════════════════════════════
 
 #═══════════════════════════════════════════════════════════════════════
 # Configuration Wizard
@@ -693,6 +1531,10 @@ _wizard_paqet() {
             exit 1
         fi
     fi
+    # Canonical names used by save_settings / config generation (a reinstall
+    # has the previous values loaded, which must not win over the wizard)
+    INTERFACE="$IFACE"
+    GATEWAY_MAC="$GW_MAC"
 
     if [ "$ROLE" = "server" ]; then
         echo ""
@@ -1094,130 +1936,9 @@ EOF
     chmod 600 "$INSTALL_DIR/config.yaml" 2>/dev/null
     log_success "Configuration saved to $INSTALL_DIR/config.yaml"
 }
-
-save_settings() {
-    # Preserve existing Telegram settings if present
-    local _tg_token="" _tg_chat="" _tg_interval=6 _tg_enabled=false
-    local _tg_alerts=true _tg_daily=true _tg_weekly=true _tg_label="" _tg_start_hour=0
-    if [ -f "$INSTALL_DIR/settings.conf" ]; then
-        # Safe settings loading without eval
-        while IFS='=' read -r key value; do
-            [[ "$key" =~ ^[A-Z_][A-Z_0-9]*$ ]] || continue
-            # Remove surrounding quotes and sanitize value
-            value="${value#\"}"; value="${value%\"}"
-            # Validate value doesn't contain dangerous characters
-            if [[ "$value" =~ [\`\$\(] ]]; then
-                continue  # Skip potentially dangerous values
-            fi
-            case "$key" in
-                TELEGRAM_BOT_TOKEN) _tg_token="$value" ;;
-                TELEGRAM_CHAT_ID) _tg_chat="$value" ;;
-                TELEGRAM_INTERVAL) [[ "$value" =~ ^[0-9]+$ ]] && _tg_interval="$value" ;;
-                TELEGRAM_ENABLED) _tg_enabled="$value" ;;
-                TELEGRAM_ALERTS_ENABLED) _tg_alerts="$value" ;;
-                TELEGRAM_DAILY_SUMMARY) _tg_daily="$value" ;;
-                TELEGRAM_WEEKLY_SUMMARY) _tg_weekly="$value" ;;
-                TELEGRAM_SERVER_LABEL) _tg_label="$value" ;;
-                TELEGRAM_START_HOUR) [[ "$value" =~ ^[0-9]+$ ]] && _tg_start_hour="$value" ;;
-                ROUTING_MODE) ROUTING_MODE="$value" ;;
-                FORWARD_PORT) FORWARD_PORT="$value" ;;
-                FORWARD_TARGET) FORWARD_TARGET="$value" ;;
-                KCP_PROFILE) KCP_PROFILE="$value" ;;
-                KCP_CONN) KCP_CONN="$value" ;;
-                KCP_MTU) KCP_MTU="$value" ;;
-                KCP_SNDWND) KCP_SNDWND="$value" ;;
-                KCP_RCVWND) KCP_RCVWND="$value" ;;
-                KCP_NODELAY) KCP_NODELAY="$value" ;;
-                KCP_INTERVAL) KCP_INTERVAL="$value" ;;
-                KCP_RESEND) KCP_RESEND="$value" ;;
-                KCP_NOCONGESTION) KCP_NOCONGESTION="$value" ;;
-                KCP_SOCKBUF) KCP_SOCKBUF="$value" ;;
-                KCP_SMUXBUF) KCP_SMUXBUF="$value" ;;
-                TURBO_ENABLED) TURBO_ENABLED="$value" ;;
-                WATCHDOG_ENABLED) WATCHDOG_ENABLED="$value" ;;
-            esac
-        done < <(grep '^[A-Z_][A-Z_0-9]*=' "$INSTALL_DIR/settings.conf")
-    fi
-
-    # Sanitize sensitive values - remove shell metacharacters and control chars
-    _sanitize_value() {
-        printf '%s' "$1" | tr -d '"$`\\'\''(){}[]<>|;&!\n\r\t'
-    }
-    local _safe_key; _safe_key=$(_sanitize_value "${ENCRYPTION_KEY:-}")
-    local _safe_auth; _safe_auth=$(_sanitize_value "${GFK_AUTH_CODE:-}")
-    local _tmp
-    _tmp=$(mktemp "$INSTALL_DIR/settings.conf.XXXXXXXX") || { log_error "Failed to create temp file"; return 1; }
-    (
-    umask 077
-    cat > "$_tmp" << EOF
-BACKEND="${BACKEND:-paqet}"
-ROLE="${ROLE}"
-PAQET_VERSION="${PAQET_VERSION:-unknown}"
-PAQCTL_VERSION="${VERSION}"
-LISTEN_PORT="${LISTEN_PORT:-}"
-SOCKS_PORT="${SOCKS_PORT:-}"
-INTERFACE="${IFACE:-}"
-LOCAL_IP="${LOCAL_IP:-}"
-GATEWAY_MAC="${GW_MAC:-}"
-ENCRYPTION_KEY="${_safe_key}"
-PAQET_TCP_LOCAL_FLAG="${PAQET_TCP_LOCAL_FLAG:-PA}"
-PAQET_TCP_REMOTE_FLAG="${PAQET_TCP_REMOTE_FLAG:-PA}"
-REMOTE_SERVER="${REMOTE_SERVER:-}"
-GFK_VIO_PORT="${GFK_VIO_PORT:-}"
-GFK_VIO_CLIENT_PORT="${GFK_VIO_CLIENT_PORT:-}"
-GFK_QUIC_PORT="${GFK_QUIC_PORT:-}"
-GFK_QUIC_CLIENT_PORT="${GFK_QUIC_CLIENT_PORT:-}"
-GFK_AUTH_CODE="${_safe_auth}"
-GFK_PORT_MAPPINGS="${GFK_PORT_MAPPINGS:-}"
-GFK_SOCKS_PORT="${GFK_SOCKS_PORT:-}"
-GFK_SOCKS_VIO_PORT="${GFK_SOCKS_VIO_PORT:-}"
-XRAY_PANEL_DETECTED="${XRAY_PANEL_DETECTED:-false}"
-MICROSOCKS_PORT="${MICROSOCKS_PORT:-}"
-GFK_SERVER_IP="${GFK_SERVER_IP:-}"
-GFK_TCP_FLAGS="${GFK_TCP_FLAGS:-AP}"
-TELEGRAM_BOT_TOKEN="${_tg_token}"
-TELEGRAM_CHAT_ID="${_tg_chat}"
-TELEGRAM_INTERVAL=${_tg_interval}
-TELEGRAM_ENABLED=${_tg_enabled}
-TELEGRAM_ALERTS_ENABLED=${_tg_alerts}
-TELEGRAM_DAILY_SUMMARY=${_tg_daily}
-TELEGRAM_WEEKLY_SUMMARY=${_tg_weekly}
-TELEGRAM_SERVER_LABEL="${_tg_label}"
-TELEGRAM_START_HOUR=${_tg_start_hour}
-ROUTING_MODE="${ROUTING_MODE:-socks5}"
-FORWARD_PORT="${FORWARD_PORT:-14000}"
-FORWARD_TARGET="${FORWARD_TARGET:-127.0.0.1:80}"
-KCP_PROFILE="${KCP_PROFILE:-standard}"
-KCP_CONN="${KCP_CONN:-2}"
-KCP_MTU="${KCP_MTU:-1350}"
-KCP_SNDWND="${KCP_SNDWND:-1024}"
-KCP_RCVWND="${KCP_RCVWND:-1024}"
-KCP_NODELAY="${KCP_NODELAY:-0}"
-KCP_INTERVAL="${KCP_INTERVAL:-20}"
-KCP_RESEND="${KCP_RESEND:-2}"
-KCP_NOCONGESTION="${KCP_NOCONGESTION:-0}"
-KCP_SOCKBUF="${KCP_SOCKBUF:-4194304}"
-KCP_SMUXBUF="${KCP_SMUXBUF:-4194304}"
-TURBO_ENABLED="${TURBO_ENABLED:-false}"
-WATCHDOG_ENABLED="${WATCHDOG_ENABLED:-false}"
-EOF
-    )
-    if ! mv "$_tmp" "$INSTALL_DIR/settings.conf"; then
-        log_error "Failed to save settings"
-        rm -f "$_tmp"
-        return 1
-    fi
-    chmod 600 "$INSTALL_DIR/settings.conf" 2>/dev/null
-    log_success "Settings saved"
-}
-
 #═══════════════════════════════════════════════════════════════════════
 # Firewall Management
 #═══════════════════════════════════════════════════════════════════════
-
-_is_firewalld_active() {
-    command -v firewall-cmd &>/dev/null && firewall-cmd --state 2>/dev/null | grep -q running
-}
 
 apply_iptables_rules() {
     local port="$1"
@@ -1342,34 +2063,6 @@ remove_iptables_rules() {
     log_success "iptables rules removed"
 }
 
-persist_iptables_rules() {
-    if _is_firewalld_active; then
-        firewall-cmd --runtime-to-permanent 2>/dev/null || true
-        return 0
-    fi
-    if [ -x /etc/init.d/iptables ]; then
-        /etc/init.d/iptables save 2>/dev/null || true
-    fi
-    if command -v netfilter-persistent &>/dev/null; then
-        netfilter-persistent save 2>/dev/null || true
-    elif command -v iptables-save &>/dev/null; then
-        if [ -d /etc/iptables ]; then
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-            command -v ip6tables-save &>/dev/null && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-        elif [ -f /etc/debian_version ] && [ ! -d /etc/iptables ]; then
-            mkdir -p /etc/iptables
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-            command -v ip6tables-save &>/dev/null && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-        elif [ -d /etc/sysconfig ]; then
-            iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
-            command -v ip6tables-save &>/dev/null && ip6tables-save > /etc/sysconfig/ip6tables 2>/dev/null || true
-        fi
-    fi
-    if command -v nft &>/dev/null && [ -f /etc/nftables.conf ]; then
-        nft list ruleset > /etc/nftables.conf 2>/dev/null || true
-    fi
-}
-
 check_iptables_rules() {
     local port="$1"
     if [ -z "$port" ]; then return 1; fi
@@ -1393,616 +2086,6 @@ check_iptables_rules() {
         return 1
     fi
 }
-
-#═══════════════════════════════════════════════════════════════════════
-# GFW-knocker Backend Functions
-#═══════════════════════════════════════════════════════════════════════
-
-install_python_deps() {
-    log_info "Installing Python dependencies for GFW-knocker..."
-    if ! command -v python3 &>/dev/null; then
-        install_package python3
-    fi
-    # Ensure python3 version >= 3.10
-    local pyver
-    pyver=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0.0")
-    local pymajor pyminor
-    pymajor=$(echo "$pyver" | cut -d. -f1)
-    pyminor=$(echo "$pyver" | cut -d. -f2)
-    if [ "$pymajor" -lt 3 ] || { [ "$pymajor" -eq 3 ] && [ "$pyminor" -lt 10 ]; }; then
-        log_error "Python 3.10+ required, found $pyver"
-        return 1
-    fi
-
-    # Install venv support (varies by distro)
-    # - Debian/Ubuntu: needs python3-venv or python3.X-venv package
-    # - Fedora/RHEL/Arch/openSUSE: venv included with python3, just need pip
-    # - Alpine: needs py3-pip
-    case "$PKG_MANAGER" in
-        apt)
-            # Debian/Ubuntu needs python3-venv package (version-specific)
-            local pyver_full
-            pyver_full=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
-            if [ -n "$pyver_full" ]; then
-                install_package "python${pyver_full}-venv" || install_package "python3-venv"
-            else
-                install_package "python3-venv"
-            fi
-            ;;
-        dnf)
-            # Fedora/RHEL 8+: venv is included with python3, just ensure pip
-            install_package "python3-pip" || true
-            ;;
-        yum)
-            # Older RHEL/CentOS 7
-            install_package "python3-pip" || true
-            ;;
-        pacman)
-            # Arch Linux: venv included with python, pip is separate
-            install_package "python-pip" || true
-            ;;
-        zypper)
-            # openSUSE: venv included with python3
-            install_package "python3-pip" || true
-            ;;
-        apk)
-            # Alpine
-            install_package "py3-pip" || true
-            ;;
-        *)
-            # Try generic python3-venv, ignore if fails (venv may be built-in)
-            install_package "python3-venv" 2>/dev/null || true
-            ;;
-    esac
-
-    # Create virtual environment
-    local VENV_DIR="$INSTALL_DIR/venv"
-    # Check if venv exists AND is complete (has pip)
-    if [ ! -x "$VENV_DIR/bin/pip" ]; then
-        # Remove broken/incomplete venv if exists
-        [ -d "$VENV_DIR" ] && rm -rf "$VENV_DIR"
-        log_info "Creating Python virtual environment..."
-        python3 -m venv "$VENV_DIR" || {
-            log_error "Failed to create virtual environment (is python3-venv installed?)"
-            return 1
-        }
-    fi
-
-    # Verify pip exists after venv creation
-    if [ ! -x "$VENV_DIR/bin/pip" ]; then
-        log_error "venv created but pip missing (install python3-venv package)"
-        return 1
-    fi
-
-    # Install packages in venv
-    log_info "Installing scapy and aioquic in venv..."
-    "$VENV_DIR/bin/pip" install --quiet --upgrade pip 2>/dev/null || true
-    "$VENV_DIR/bin/pip" install --quiet scapy aioquic 2>/dev/null || {
-        # Try with --break-system-packages as fallback (shouldn't be needed in venv)
-        "$VENV_DIR/bin/pip" install scapy aioquic || {
-            log_error "Failed to install Python packages (scapy, aioquic)"
-            return 1
-        }
-    }
-
-    # Verify
-    if "$VENV_DIR/bin/python" -c "import scapy; import aioquic" 2>/dev/null; then
-        log_success "Python dependencies installed (scapy, aioquic)"
-    else
-        log_error "Python package verification failed"
-        return 1
-    fi
-}
-
-install_microsocks() {
-    log_info "Installing microsocks for SOCKS5 proxy..."
-    if [ -x "$INSTALL_DIR/bin/microsocks" ]; then
-        log_success "microsocks already installed"
-        return 0
-    fi
-    # Build dependencies
-    command -v gcc &>/dev/null || install_package gcc
-    command -v make &>/dev/null || install_package make
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    if ! curl -sL "https://github.com/${MICROSOCKS_REPO}/archive/refs/heads/master.tar.gz" -o "$tmp_dir/microsocks.tar.gz"; then
-        log_error "Failed to download microsocks"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-    tar -xzf "$tmp_dir/microsocks.tar.gz" -C "$tmp_dir" 2>/dev/null || {
-        log_error "Failed to extract microsocks"
-        rm -rf "$tmp_dir"
-        return 1
-    }
-    local src_dir
-    src_dir=$(find "$tmp_dir" -maxdepth 1 -type d -name "microsocks*" | head -1)
-    if [ -z "$src_dir" ]; then
-        log_error "microsocks source directory not found"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-    if ! make -C "$src_dir" -j"$(nproc 2>/dev/null || echo 1)" 2>/dev/null; then
-        log_error "Failed to compile microsocks"
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-    mkdir -p "$INSTALL_DIR/bin"
-    cp "$src_dir/microsocks" "$INSTALL_DIR/bin/microsocks"
-    chmod 755 "$INSTALL_DIR/bin/microsocks"
-    rm -rf "$tmp_dir"
-    log_success "microsocks installed"
-}
-
-#───────────────────────────────────────────────────────────────────────
-# Xray Installation (for GFK server - provides SOCKS5 on port 443)
-#───────────────────────────────────────────────────────────────────────
-
-XRAY_CONFIG_DIR="/usr/local/etc/xray"
-XRAY_CONFIG_FILE="$XRAY_CONFIG_DIR/config.json"
-
-check_xray_installed() {
-    command -v xray &>/dev/null && return 0
-    [ -x /usr/local/bin/xray ] && return 0
-    [ -x /usr/local/x-ui/bin/xray-linux-amd64 ] && return 0
-    return 1
-}
-
-install_xray() {
-    if check_xray_installed; then
-        log_info "Xray is already installed"
-        return 0
-    fi
-
-    log_info "Installing Xray ${XRAY_VERSION_PINNED}..."
-
-    # Use official Xray install script with pinned version for stability
-    local tmp_script
-    tmp_script=$(mktemp)
-    if ! curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$tmp_script"; then
-        log_error "Failed to download Xray installer"
-        rm -f "$tmp_script"
-        return 1
-    fi
-
-    # Install specific version (not latest) for stability
-    if ! bash "$tmp_script" install --version "$XRAY_VERSION_PINNED" 2>/dev/null; then
-        log_error "Failed to install Xray"
-        rm -f "$tmp_script"
-        return 1
-    fi
-    rm -f "$tmp_script"
-
-    log_success "Xray ${XRAY_VERSION_PINNED} installed"
-}
-
-configure_xray_socks() {
-    local listen_port="${1:-443}"
-
-    log_info "Configuring Xray SOCKS5 proxy on port $listen_port..."
-
-    mkdir -p "$XRAY_CONFIG_DIR"
-
-    # Create simple SOCKS5 inbound config
-    cat > "$XRAY_CONFIG_FILE" << EOF
-{
-  "log": {
-    "loglevel": "warning"
-  },
-  "inbounds": [
-    {
-      "tag": "socks-in",
-      "port": ${listen_port},
-      "listen": "127.0.0.1",
-      "protocol": "socks",
-      "settings": {
-        "auth": "noauth",
-        "udp": true
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls"]
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "tag": "direct",
-      "protocol": "freedom",
-      "settings": {}
-    }
-  ]
-}
-EOF
-    chmod 644 "$XRAY_CONFIG_FILE"  # Xray service runs as 'nobody', needs read access
-    log_success "Xray configured (SOCKS5 on 127.0.0.1:$listen_port)"
-}
-
-# Check if running xray is paqctl's own standalone install (not a real panel)
-# Returns 0 if standalone (all inbounds are socks on 127.0.0.1), 1 if panel
-_is_paqctl_standalone_xray() {
-    [ -f "$XRAY_CONFIG_FILE" ] || return 1
-    command -v python3 &>/dev/null || return 1
-    python3 -c "
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        cfg = json.load(f)
-    inbounds = cfg.get('inbounds', [])
-    if not inbounds:
-        sys.exit(1)
-    for i in inbounds:
-        if i.get('protocol') != 'socks' or i.get('listen', '0.0.0.0') != '127.0.0.1':
-            sys.exit(1)
-    sys.exit(0)
-except:
-    sys.exit(1)
-" "$XRAY_CONFIG_FILE" 2>/dev/null
-}
-
-# Add a SOCKS5 inbound to an existing xray config (panel) without touching other inbounds
-_add_xray_gfk_socks() {
-    local port="$1"
-    python3 -c "
-import json, sys
-port = int(sys.argv[1])
-config_path = sys.argv[2]
-try:
-    with open(config_path, 'r') as f:
-        cfg = json.load(f)
-except:
-    cfg = {'inbounds': [], 'outbounds': [{'tag': 'direct', 'protocol': 'freedom', 'settings': {}}]}
-cfg.setdefault('inbounds', [])
-cfg['inbounds'] = [i for i in cfg['inbounds'] if i.get('tag') != 'gfk-socks']
-cfg['inbounds'].append({
-    'tag': 'gfk-socks',
-    'port': port,
-    'listen': '127.0.0.1',
-    'protocol': 'socks',
-    'settings': {'auth': 'noauth', 'udp': True},
-    'sniffing': {'enabled': True, 'destOverride': ['http', 'tls']}
-})
-if not any(o.get('protocol') == 'freedom' for o in cfg.get('outbounds', [])):
-    cfg.setdefault('outbounds', []).append({'tag': 'direct', 'protocol': 'freedom', 'settings': {}})
-with open(config_path, 'w') as f:
-    json.dump(cfg, f, indent=2)
-" "$port" "$XRAY_CONFIG_FILE" 2>/dev/null
-    if [ $? -ne 0 ]; then
-        log_error "Failed to add SOCKS5 inbound to existing Xray config"
-        return 1
-    fi
-    log_success "Added GFK SOCKS5 inbound on 127.0.0.1:$port"
-}
-
-start_xray() {
-    log_info "Starting Xray service..."
-
-    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
-        # Stop first, reload daemon, then start - with retry
-        systemctl stop xray 2>/dev/null || true
-        sleep 1
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl enable xray 2>/dev/null || true
-
-        # Try up to 3 times
-        local attempt
-        for attempt in 1 2 3; do
-            systemctl start xray 2>/dev/null
-            sleep 2
-            if systemctl is-active --quiet xray; then
-                log_success "Xray started"
-                return 0
-            fi
-            [ "$attempt" -lt 3 ] && sleep 1
-        done
-        log_error "Failed to start Xray after 3 attempts"
-        return 1
-    else
-        # Direct start for non-systemd
-        local _xray_bin=""
-        [ -x /usr/local/bin/xray ] && _xray_bin="/usr/local/bin/xray"
-        [ -z "$_xray_bin" ] && [ -x /usr/local/x-ui/bin/xray-linux-amd64 ] && _xray_bin="/usr/local/x-ui/bin/xray-linux-amd64"
-        if [ -n "$_xray_bin" ]; then
-            pkill -x xray 2>/dev/null || true
-            sleep 1
-            nohup "$_xray_bin" run -c "$XRAY_CONFIG_FILE" > /var/log/xray.log 2>&1 &
-            sleep 2
-            if pgrep -f "xray" &>/dev/null; then
-                log_success "Xray started"
-                return 0
-            fi
-        fi
-        log_error "Failed to start Xray"
-        return 1
-    fi
-}
-
-stop_xray() {
-    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
-        systemctl stop xray 2>/dev/null || true
-    else
-        pkill -x xray 2>/dev/null || true
-    fi
-}
-
-setup_xray_for_gfk() {
-    local target_port
-    target_port=$(echo "${GFK_PORT_MAPPINGS:-14000:443}" | cut -d: -f2 | cut -d, -f1)
-
-    if pgrep -x xray &>/dev/null || pgrep -f "xray-linux" &>/dev/null; then
-        # Check if this is paqctl's own standalone Xray (not a real panel)
-        if _is_paqctl_standalone_xray; then
-            log_info "Existing Xray is paqctl's standalone install — reconfiguring..."
-            stop_xray
-            sleep 1
-            # Fall through to standalone install path below
-        else
-            XRAY_PANEL_DETECTED=true
-            log_info "Existing Xray detected — adding SOCKS5 alongside panel..."
-
-            # Clean up any leftover standalone GFK xray from prior installs
-            pkill -f "xray run -c.*gfk-socks.json" 2>/dev/null || true
-            rm -f "${XRAY_CONFIG_DIR}/gfk-socks.json" 2>/dev/null
-
-            # Check all existing target ports from mappings
-            local mapping pairs
-            IFS=',' read -ra pairs <<< "${GFK_PORT_MAPPINGS:-14000:443}"
-            for mapping in "${pairs[@]}"; do
-                local vio_port="${mapping%%:*}"
-                local tp="${mapping##*:}"
-                if ss -tln 2>/dev/null | grep -q ":${tp} "; then
-                    log_success "Port $tp is listening — GFK will forward VIO port $vio_port to this port"
-                else
-                    log_warn "Port $tp is NOT listening — make sure your panel inbound is on port $tp"
-                fi
-            done
-
-            # Find free port for SOCKS5 (starting at 10443)
-            local socks_port=10443
-            while ss -tln 2>/dev/null | grep -q ":${socks_port} "; do
-                socks_port=$((socks_port + 1))
-                if [ "$socks_port" -gt 65000 ]; then
-                    log_warn "Could not find free port for SOCKS5 — panel-only mode"
-                    echo ""
-                    local first_vio
-                    first_vio=$(echo "${GFK_PORT_MAPPINGS:-14000:443}" | cut -d: -f1 | cut -d, -f1)
-                    log_warn "For panel-to-panel: configure Iran panel outbound to 127.0.0.1:${first_vio}"
-                    return 0
-                fi
-            done
-
-            # Add SOCKS5 inbound to existing xray config
-            _add_xray_gfk_socks "$socks_port" || {
-                log_warn "Could not add SOCKS5 to panel config — panel-only mode"
-                return 0
-            }
-
-            # Restart xray to load new config
-            systemctl restart xray 2>/dev/null || pkill -SIGHUP xray 2>/dev/null || true
-            sleep 2
-
-            # Find next VIO port (highest existing + 1) and append SOCKS5 mapping
-            local max_vio=0
-            for mapping in "${pairs[@]}"; do
-                local v="${mapping%%:*}"
-                [ "$v" -gt "$max_vio" ] && max_vio="$v"
-            done
-            local socks_vio=$((max_vio + 1))
-            GFK_PORT_MAPPINGS="${GFK_PORT_MAPPINGS},${socks_vio}:${socks_port}"
-            GFK_SOCKS_PORT="$socks_port"
-            GFK_SOCKS_VIO_PORT="$socks_vio"
-
-            log_success "SOCKS5 proxy added on port $socks_port (VIO port $socks_vio)"
-            echo ""
-            log_info "Port mappings updated: ${GFK_PORT_MAPPINGS}"
-            log_warn "Use these SAME mappings on the client side"
-            echo ""
-            local first_vio
-            first_vio=$(echo "${GFK_PORT_MAPPINGS:-14000:443}" | cut -d: -f1 | cut -d, -f1)
-            log_warn "For panel-to-panel: configure Iran panel outbound to 127.0.0.1:${first_vio}"
-            log_warn "For direct SOCKS5: use 127.0.0.1:${socks_vio} as your proxy on client"
-            return 0
-        fi
-    fi
-
-    install_xray || return 1
-    configure_xray_socks "$target_port" || return 1
-    start_xray || return 1
-}
-
-download_gfk() {
-    log_info "Downloading GFW-knocker scripts..."
-    if ! mkdir -p "$GFK_DIR"; then
-        log_error "Failed to create $GFK_DIR"
-        return 1
-    fi
-    # Note: parameters.py is generated by generate_gfk_config(), don't download it
-    # Download server scripts from gfk/server/
-    local server_files="mainserver.py quic_server.py vio_server.py"
-    local f
-    for f in $server_files; do
-        if ! curl -sL "$GFK_RAW_URL/server/$f" -o "$GFK_DIR/$f"; then
-            log_error "Failed to download $f"
-            return 1
-        fi
-    done
-    # Download client scripts from gfk/client/
-    local client_files="mainclient.py quic_client.py vio_client.py"
-    for f in $client_files; do
-        if ! curl -sL "$GFK_RAW_URL/client/$f" -o "$GFK_DIR/$f"; then
-            log_error "Failed to download $f"
-            return 1
-        fi
-    done
-    chmod 600 "$GFK_DIR"/*.py
-    # Patch mainserver.py to use venv python for subprocesses
-    if [ -f "$GFK_DIR/mainserver.py" ]; then
-        sed -i "s|'python3'|'$INSTALL_DIR/venv/bin/python'|g" "$GFK_DIR/mainserver.py"
-    fi
-    log_success "GFW-knocker scripts downloaded to $GFK_DIR"
-}
-
-generate_gfk_certs() {
-    if [ -f "$GFK_DIR/cert.pem" ] && [ -f "$GFK_DIR/key.pem" ]; then
-        log_info "GFW-knocker certificates already exist"
-        return 0
-    fi
-    if ! command -v openssl &>/dev/null; then
-        log_info "Installing openssl..."
-        install_package openssl || { log_error "Failed to install openssl"; return 1; }
-    fi
-    log_info "Generating QUIC TLS certificates..."
-    if ! openssl req -x509 -newkey rsa:2048 -keyout "$GFK_DIR/key.pem" \
-        -out "$GFK_DIR/cert.pem" -days 3650 -nodes -subj "/CN=gfk" 2>/dev/null; then
-        log_error "Failed to generate certificates"
-        return 1
-    fi
-    chmod 600 "$GFK_DIR/key.pem" "$GFK_DIR/cert.pem"
-    log_success "QUIC certificates generated"
-}
-
-generate_gfk_config() {
-    log_info "Generating GFW-knocker configuration..."
-    # Ensure GFK directory exists
-    mkdir -p "$GFK_DIR" || { log_error "Failed to create $GFK_DIR"; return 1; }
-    local _tmp
-    _tmp=$(mktemp "$GFK_DIR/parameters.py.XXXXXXXX") || { log_error "Failed to create temp file"; return 1; }
-
-    # Determine port values based on role - validate they are numeric
-    local vio_tcp_server_port="${GFK_VIO_PORT:-45000}"
-    local vio_tcp_client_port="${GFK_VIO_CLIENT_PORT:-40000}"
-    local vio_udp_server_port="${GFK_VIO_UDP_SERVER:-35000}"
-    local vio_udp_client_port="${GFK_VIO_UDP_CLIENT:-30000}"
-    local quic_server_port="${GFK_QUIC_PORT:-25000}"
-    local quic_client_port="${GFK_QUIC_CLIENT_PORT:-20000}"
-
-    # Validate all ports are numeric
-    for _p in "$vio_tcp_server_port" "$vio_tcp_client_port" "$vio_udp_server_port" \
-              "$vio_udp_client_port" "$quic_server_port" "$quic_client_port"; do
-        if ! [[ "$_p" =~ ^[0-9]+$ ]]; then
-            log_error "Invalid port number: $_p"
-            rm -f "$_tmp"
-            return 1
-        fi
-    done
-
-    # Escape Python string - prevents code injection
-    _escape_py_string() {
-        local s="$1"
-        s="${s//\\/\\\\}"   # Escape backslashes first
-        s="${s//\"/\\\"}"   # Escape double quotes
-        s="${s//\'/\\\'}"   # Escape single quotes
-        s="${s//$'\n'/\\n}" # Escape newlines
-        s="${s//$'\r'/\\r}" # Escape carriage returns
-        printf '%s' "$s"
-    }
-
-    # Validate and escape server IP
-    local safe_server_ip
-    safe_server_ip=$(_escape_py_string "${GFK_SERVER_IP:-}")
-    if ! _validate_ip "${GFK_SERVER_IP:-}"; then
-        log_error "Invalid server IP: ${GFK_SERVER_IP:-}"
-        rm -f "$_tmp"
-        return 1
-    fi
-
-    # Validate and escape auth code
-    local safe_auth_code
-    safe_auth_code=$(_escape_py_string "${GFK_AUTH_CODE:-}")
-
-    # Build port mapping dict string with validation
-    local tcp_mapping="${GFK_PORT_MAPPINGS:-14000:443}"
-    local mapping_str="{"
-    local first=true
-    local pair
-    for pair in $(echo "$tcp_mapping" | tr ',' ' '); do
-        local lport rport
-        lport=$(echo "$pair" | cut -d: -f1)
-        rport=$(echo "$pair" | cut -d: -f2)
-        # Validate both ports are numeric
-        if ! [[ "$lport" =~ ^[0-9]+$ ]] || ! [[ "$rport" =~ ^[0-9]+$ ]]; then
-            log_error "Invalid port mapping: $pair (must be numeric:numeric)"
-            rm -f "$_tmp"
-            return 1
-        fi
-        if [ "$first" = true ]; then
-            mapping_str="${mapping_str}${lport}: ${rport}"
-            first=false
-        else
-            mapping_str="${mapping_str}, ${lport}: ${rport}"
-        fi
-    done
-    mapping_str="${mapping_str}}"
-
-    # Escape GFK_DIR for Python string
-    local safe_gfk_dir
-    safe_gfk_dir=$(_escape_py_string "${GFK_DIR}")
-
-    (
-    umask 077
-    cat > "$_tmp" << PYEOF
-# GFW-knocker parameters - auto-generated by paqctl
-# Do not edit manually
-
-vps_ip = "${safe_server_ip}"
-xray_server_ip_address = "127.0.0.1"
-
-tcp_port_mapping = ${mapping_str}
-udp_port_mapping = {}
-
-vio_tcp_server_port = ${vio_tcp_server_port}
-vio_tcp_client_port = ${vio_tcp_client_port}
-vio_udp_server_port = ${vio_udp_server_port}
-vio_udp_client_port = ${vio_udp_client_port}
-
-quic_server_port = ${quic_server_port}
-quic_client_port = ${quic_client_port}
-quic_local_ip = "127.0.0.1"
-
-quic_idle_timeout = 86400
-udp_timeout = 300
-quic_mtu = ${KCP_MTU:-1350}
-quic_verify_cert = False
-quic_max_data = 1073741824
-quic_max_stream_data = 1073741824
-
-quic_auth_code = "${safe_auth_code}"
-
-quic_cert_filepath = ("${safe_gfk_dir}/cert.pem", "${safe_gfk_dir}/key.pem")
-
-tcp_flags = "${GFK_TCP_FLAGS:-AP}"
-PYEOF
-    )
-    if ! mv "$_tmp" "$GFK_DIR/parameters.py"; then
-        log_error "Failed to save GFW-knocker configuration"
-        rm -f "$_tmp"
-        return 1
-    fi
-    chmod 600 "$GFK_DIR/parameters.py"
-    log_success "GFW-knocker configuration saved"
-}
-
-create_gfk_client_wrapper() {
-    log_info "Creating GFW-knocker client wrapper..."
-    local wrapper="$INSTALL_DIR/bin/gfk-client.sh"
-    mkdir -p "$INSTALL_DIR/bin"
-    cat > "$wrapper" << 'WRAPEOF'
-#!/bin/bash
-set -e
-GFK_DIR="REPLACE_ME_GFK_DIR"
-INSTALL_DIR="REPLACE_ME_INSTALL_DIR"
-
-cd "$GFK_DIR"
-"$INSTALL_DIR/venv/bin/python" mainclient.py &
-PID1=$!
-trap "kill $PID1 2>/dev/null; wait" EXIT INT TERM
-wait
-WRAPEOF
-    sed "s#REPLACE_ME_GFK_DIR#${GFK_DIR}#g; s#REPLACE_ME_INSTALL_DIR#${INSTALL_DIR}#g" "$wrapper" > "$wrapper.sed" && mv "$wrapper.sed" "$wrapper"
-    chmod 755 "$wrapper"
-    log_success "Client wrapper created at $wrapper"
-}
-
 #═══════════════════════════════════════════════════════════════════════
 # Service Management
 #═══════════════════════════════════════════════════════════════════════
@@ -2361,7 +2444,6 @@ LOGROTATE
 
     log_success "Log rotation configured (7 days, compressed)"
 }
-
 #═══════════════════════════════════════════════════════════════════════
 # Management Script (Embedded)
 #═══════════════════════════════════════════════════════════════════════
@@ -2378,6 +2460,11 @@ create_management_script() {
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
+INSTALL_DIR="REPLACE_ME_INSTALL_DIR"
+# shellcheck shell=bash
+# Versions, repositories and colours shared by the installer and the management script.
+# INSTALL_DIR must be set before this file is included.
+
 VERSION="1.2.0"
 
 # Pinned versions for stability (update these after testing new releases)
@@ -2385,15 +2472,15 @@ PAQET_VERSION_PINNED="v1.0.0-alpha.21-a1"
 XRAY_VERSION_PINNED="v26.2.4"
 GFK_VERSION_PINNED="v1.0.0"
 
-INSTALL_DIR="REPLACE_ME_INSTALL_DIR"
-BACKUP_DIR="$INSTALL_DIR/backups"
 PAQET_REPO="4H1R/paqet"
 PAQET_API_URL="https://api.github.com/repos/${PAQET_REPO}/releases/latest"
 GFK_REPO="4H1R/paqctl"
 GFK_BRANCH="main"
 GFK_RAW_URL="https://raw.githubusercontent.com/${GFK_REPO}/${GFK_BRANCH}/gfk"
-GFK_DIR="$INSTALL_DIR/gfk"
 MICROSOCKS_REPO="rofl0r/microsocks"
+
+BACKUP_DIR="$INSTALL_DIR/backups"
+GFK_DIR="$INSTALL_DIR/gfk"
 
 # Colors
 RED='\033[0;31m'
@@ -2435,19 +2522,102 @@ if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ] || [ "$JSON_OUTPUT" = true ]; then
     RED='' GREEN='' YELLOW='' BLUE='' CYAN='' MAGENTA='' BOLD='' DIM='' NC=''
 fi
 
-# Input validation helpers
+# shellcheck shell=bash
+# Shared helpers used by both the installer and the management script.
+# Included into both the installer and the management script by build.sh.
+
+#═══════════════════════════════════════════════════════════════════════
+# Input validation
+#═══════════════════════════════════════════════════════════════════════
+
 _validate_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
 _validate_ip() {
     [[ "$1" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
     local IFS='.'; set -- $1
     [ "$1" -le 255 ] && [ "$2" -le 255 ] && [ "$3" -le 255 ] && [ "$4" -le 255 ]
 }
-_validate_mac() { [[ "$1" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; }
-_validate_iface() { [[ "$1" =~ ^[a-zA-Z0-9._-]+$ ]] && [ ${#1} -le 64 ]; }
-# Safe string length check - prevents DoS via extremely long inputs
-_check_length() { [ ${#1} -le "${2:-256}" ]; }
 
-# Network auto-detection
+_validate_mac() { [[ "$1" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; }
+
+_validate_iface() { [[ "$1" =~ ^[a-zA-Z0-9._-]+$ ]] && [ ${#1} -le 64 ]; }
+
+_validate_version_tag() {
+    # Strict validation: only allow vX.Y.Z or X.Y.Z format with optional -suffix
+    [[ "$1" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?$ ]]
+}
+
+#═══════════════════════════════════════════════════════════════════════
+# Logging & output
+#═══════════════════════════════════════════════════════════════════════
+
+# In --json mode, human-readable log lines go to stderr so stdout stays valid JSON
+_log_fd() { if [ "${JSON_OUTPUT:-false}" = true ]; then cat >&2; else cat; fi; }
+log_info()    { echo -e "${BLUE}[INFO]${NC} $1" | _log_fd; }
+log_success() { echo -e "${GREEN}[✓]${NC} $1" | _log_fd; }
+log_warn()    { echo -e "${YELLOW}[!]${NC} $1" | _log_fd; }
+log_error()   { echo -e "${RED}[✗]${NC} $1" >&2; }
+
+print_header() {
+    echo -e "${CYAN}"
+    echo "╔════════════════════════════════════════════════════════════════╗"
+    echo "║                  PAQCTL - Paqet Manager v${VERSION}                   ║"
+    echo "║        Raw-socket encrypted proxy - bypass firewalls           ║"
+    echo "╚════════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+#═══════════════════════════════════════════════════════════════════════
+# Network & system detection
+#═══════════════════════════════════════════════════════════════════════
+
+# Retry helper with exponential backoff for API requests
+_curl_with_retry() {
+    local url="$1"
+    local max_attempts="${2:-3}"
+    local attempt=1
+    local delay=2
+    local response=""
+    while [ $attempt -le $max_attempts ]; do
+        response=$(curl -s --max-time 15 "$url" 2>/dev/null)
+        if [ -n "$response" ]; then
+            # Check for rate limit response
+            if echo "$response" | grep -q '"message".*rate limit'; then
+                log_warn "GitHub API rate limited, waiting ${delay}s (attempt $attempt/$max_attempts)"
+                sleep $delay
+                delay=$((delay * 2))
+                attempt=$((attempt + 1))
+                continue
+            fi
+            echo "$response"
+            return 0
+        fi
+        [ $attempt -lt $max_attempts ] && sleep $delay
+        delay=$((delay * 2))
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+detect_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7l|armv7|armhf) echo "arm32" ;;
+        mips64el|mips64le) echo "mips64le" ;;
+        mips64) echo "mips64" ;;
+        mipsel|mipsle) echo "mipsle" ;;
+        mips) echo "mips" ;;
+        *)
+            log_error "Unsupported architecture: $arch"
+            log_error "Paqet supports amd64, arm64, arm32, and MIPS variants"
+            return 1
+            ;;
+    esac
+}
+
 detect_network() {
     log_info "Auto-detecting network configuration..."
 
@@ -2470,6 +2640,7 @@ detect_network() {
     fi
 
     if [ -z "$DETECTED_IFACE" ]; then
+        # Skip loopback, docker, veth, bridge, and other virtual interfaces
         # Note: grep -v returns exit 1 if no matches, so we add || true for pipefail
         DETECTED_IFACE=$(ip -o link show 2>/dev/null | awk -F': ' '{gsub(/ /,"",$2); print $2}' | { grep -vE '^(lo|docker[0-9]|br-|veth|virbr|tun|tap|wg)' || true; } | head -1)
     fi
@@ -2484,7 +2655,7 @@ detect_network() {
         [ -z "$DETECTED_IP" ] && DETECTED_IP=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{gsub(/\/.*/, "", $2); print $2; exit}')
     fi
 
-    # Gateway IP - handle OpenVZ format (may not have gateway)
+    # Gateway IP - only present in standard "via X" format, not in OpenVZ
     if [[ "$_route_line" == *" via "* ]]; then
         DETECTED_GATEWAY=$(echo "$_route_line" | awk '{print $3}')
     else
@@ -2494,13 +2665,16 @@ detect_network() {
     # Gateway MAC
     DETECTED_GW_MAC=""
     if [ -n "$DETECTED_GATEWAY" ]; then
+        # Try ip neigh first (most reliable on Linux)
         DETECTED_GW_MAC=$(ip neigh show "$DETECTED_GATEWAY" 2>/dev/null | awk '/lladdr/{print $5; exit}')
         if [ -z "$DETECTED_GW_MAC" ]; then
+            # Trigger ARP resolution
             ping -c 1 -W 2 "$DETECTED_GATEWAY" &>/dev/null || true
             sleep 1
             DETECTED_GW_MAC=$(ip neigh show "$DETECTED_GATEWAY" 2>/dev/null | awk '/lladdr/{print $5; exit}')
         fi
         if [ -z "$DETECTED_GW_MAC" ] && command -v arp &>/dev/null; then
+            # Fallback: parse arp output looking for MAC pattern
             # Note: grep returns exit 1 if no matches, so we add || true for pipefail
             DETECTED_GW_MAC=$(arp -n "$DETECTED_GATEWAY" 2>/dev/null | { grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' || true; } | head -1)
         fi
@@ -2512,12 +2686,132 @@ detect_network() {
     log_info "GW MAC:    ${DETECTED_GW_MAC:-unknown}"
 }
 
+# Package manager for install_package. The installer sets PKG_MANAGER in
+# detect_os; the management script detects it on first use.
+_ensure_pkg_manager() {
+    [ -n "${PKG_MANAGER:-}" ] && [ "$PKG_MANAGER" != "unknown" ] && return 0
+    if command -v apt-get &>/dev/null; then PKG_MANAGER="apt"
+    elif command -v dnf &>/dev/null; then PKG_MANAGER="dnf"
+    elif command -v yum &>/dev/null; then PKG_MANAGER="yum"
+    elif command -v pacman &>/dev/null; then PKG_MANAGER="pacman"
+    elif command -v zypper &>/dev/null; then PKG_MANAGER="zypper"
+    elif command -v apk &>/dev/null; then PKG_MANAGER="apk"
+    else PKG_MANAGER="unknown"
+    fi
+}
+
+install_package() {
+    local package="$1"
+    _ensure_pkg_manager
+    log_info "Installing $package..."
+
+    case "$PKG_MANAGER" in
+        apt)
+            apt-get update -q 2>/dev/null || log_warn "apt-get update failed, attempting install anyway..."
+            if apt-get install -y -q "$package"; then
+                log_success "$package installed successfully"
+            else
+                log_error "Failed to install $package"
+                return 1
+            fi
+            ;;
+        dnf)
+            if dnf install -y -q "$package"; then
+                log_success "$package installed successfully"
+            else
+                log_error "Failed to install $package"
+                return 1
+            fi
+            ;;
+        yum)
+            if yum install -y -q "$package"; then
+                log_success "$package installed successfully"
+            else
+                log_error "Failed to install $package"
+                return 1
+            fi
+            ;;
+        pacman)
+            if pacman -Sy --noconfirm "$package"; then
+                log_success "$package installed successfully"
+            else
+                log_error "Failed to install $package"
+                return 1
+            fi
+            ;;
+        zypper)
+            if zypper install -y -n "$package"; then
+                log_success "$package installed successfully"
+            else
+                log_error "Failed to install $package"
+                return 1
+            fi
+            ;;
+        apk)
+            if apk add --no-cache "$package"; then
+                log_success "$package installed successfully"
+            else
+                log_error "Failed to install $package"
+                return 1
+            fi
+            ;;
+        *)
+            log_warn "Unknown package manager. Please install $package manually."
+            return 1
+            ;;
+    esac
+}
+
+#═══════════════════════════════════════════════════════════════════════
+# Firewall persistence
+#═══════════════════════════════════════════════════════════════════════
+
+_is_firewalld_active() {
+    command -v firewall-cmd &>/dev/null && firewall-cmd --state 2>/dev/null | grep -q running
+}
+
+persist_iptables_rules() {
+    if _is_firewalld_active; then
+        firewall-cmd --runtime-to-permanent 2>/dev/null || true
+        return 0
+    fi
+    if [ -x /etc/init.d/iptables ]; then
+        /etc/init.d/iptables save 2>/dev/null || true
+    fi
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save 2>/dev/null || true
+    elif command -v iptables-save &>/dev/null; then
+        if [ -d /etc/iptables ]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            command -v ip6tables-save &>/dev/null && { ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true; }
+        elif [ -f /etc/debian_version ]; then
+            mkdir -p /etc/iptables
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            command -v ip6tables-save &>/dev/null && { ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true; }
+        elif [ -d /etc/sysconfig ]; then
+            iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+            command -v ip6tables-save &>/dev/null && { ip6tables-save > /etc/sysconfig/ip6tables 2>/dev/null || true; }
+        fi
+    fi
+    if command -v nft &>/dev/null && [ -f /etc/nftables.conf ]; then
+        nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+    fi
+}
+
+#═══════════════════════════════════════════════════════════════════════
+# Settings (settings.conf)
+#═══════════════════════════════════════════════════════════════════════
+
+# _load_settings [KEY...]
+# Load settings.conf into shell variables (no eval). With KEY arguments only
+# those keys are loaded, e.g. to carry Telegram settings over a reinstall.
 _load_settings() {
     # Unreadable (e.g. non-root running 'paqctl help') is not an error
     [ -r "$INSTALL_DIR/settings.conf" ] || return 0
-    # Safe settings loading without eval - uses case statement
+    local _only=" $* " key value
     while IFS='=' read -r key value; do
         [[ "$key" =~ ^[A-Z_][A-Z_0-9]*$ ]] || continue
+        [ $# -eq 0 ] || [[ "$_only" == *" $key "* ]] || continue
         value="${value#\"}"; value="${value%\"}"
         # Skip values with dangerous shell characters
         [[ "$value" =~ [\`\$\(] ]] && continue
@@ -2576,6 +2870,820 @@ _load_settings() {
     done < <(grep '^[A-Z_][A-Z_0-9]*=' "$INSTALL_DIR/settings.conf")
 }
 
+# Write settings.conf atomically from the current shell variables.
+save_settings() {
+    local _tg_token="${TELEGRAM_BOT_TOKEN:-}"
+    local _tg_chat="${TELEGRAM_CHAT_ID:-}"
+    local _tg_interval="${TELEGRAM_INTERVAL:-6}"
+    local _tg_enabled="${TELEGRAM_ENABLED:-false}"
+    local _tg_alerts="${TELEGRAM_ALERTS_ENABLED:-true}"
+    local _tg_daily="${TELEGRAM_DAILY_SUMMARY:-true}"
+    local _tg_weekly="${TELEGRAM_WEEKLY_SUMMARY:-true}"
+    local _tg_label="${TELEGRAM_SERVER_LABEL:-}"
+    local _tg_start_hour="${TELEGRAM_START_HOUR:-0}"
+    # Sanitize sensitive values - remove shell metacharacters and control chars
+    _sanitize_value() {
+        printf '%s' "$1" | tr -d '"$`\\'\''(){}[]<>|;&!\n\r\t'
+    }
+    local _safe_key; _safe_key=$(_sanitize_value "${ENCRYPTION_KEY:-}")
+    local _safe_auth; _safe_auth=$(_sanitize_value "${GFK_AUTH_CODE:-}")
+    local _tmp
+    _tmp=$(mktemp "$INSTALL_DIR/settings.conf.XXXXXXXX") || { log_error "Failed to create temp file"; return 1; }
+    (umask 077; cat > "$_tmp" << SEOF
+BACKEND="${BACKEND:-paqet}"
+ROLE="${ROLE}"
+PAQET_VERSION="${PAQET_VERSION:-unknown}"
+PAQCTL_VERSION="${VERSION}"
+LISTEN_PORT="${LISTEN_PORT:-}"
+SOCKS_PORT="${SOCKS_PORT:-}"
+INTERFACE="${INTERFACE:-${IFACE:-}}"
+LOCAL_IP="${LOCAL_IP:-}"
+GATEWAY_MAC="${GATEWAY_MAC:-${GW_MAC:-}}"
+ENCRYPTION_KEY="${_safe_key}"
+PAQET_TCP_LOCAL_FLAG="${PAQET_TCP_LOCAL_FLAG:-PA}"
+PAQET_TCP_REMOTE_FLAG="${PAQET_TCP_REMOTE_FLAG:-PA}"
+REMOTE_SERVER="${REMOTE_SERVER:-}"
+GFK_VIO_PORT="${GFK_VIO_PORT:-}"
+GFK_VIO_CLIENT_PORT="${GFK_VIO_CLIENT_PORT:-}"
+GFK_QUIC_PORT="${GFK_QUIC_PORT:-}"
+GFK_QUIC_CLIENT_PORT="${GFK_QUIC_CLIENT_PORT:-}"
+GFK_AUTH_CODE="${_safe_auth}"
+GFK_PORT_MAPPINGS="${GFK_PORT_MAPPINGS:-}"
+GFK_SOCKS_PORT="${GFK_SOCKS_PORT:-}"
+GFK_SOCKS_VIO_PORT="${GFK_SOCKS_VIO_PORT:-}"
+XRAY_PANEL_DETECTED="${XRAY_PANEL_DETECTED:-false}"
+MICROSOCKS_PORT="${MICROSOCKS_PORT:-}"
+GFK_SERVER_IP="${GFK_SERVER_IP:-}"
+GFK_TCP_FLAGS="${GFK_TCP_FLAGS:-AP}"
+TELEGRAM_BOT_TOKEN="${_tg_token}"
+TELEGRAM_CHAT_ID="${_tg_chat}"
+TELEGRAM_INTERVAL=${_tg_interval}
+TELEGRAM_ENABLED=${_tg_enabled}
+TELEGRAM_ALERTS_ENABLED=${_tg_alerts}
+TELEGRAM_DAILY_SUMMARY=${_tg_daily}
+TELEGRAM_WEEKLY_SUMMARY=${_tg_weekly}
+TELEGRAM_SERVER_LABEL="${_tg_label}"
+TELEGRAM_START_HOUR=${_tg_start_hour}
+ROUTING_MODE="${ROUTING_MODE:-socks5}"
+FORWARD_PORT="${FORWARD_PORT:-14000}"
+FORWARD_TARGET="${FORWARD_TARGET:-127.0.0.1:80}"
+KCP_PROFILE="${KCP_PROFILE:-standard}"
+KCP_CONN="${KCP_CONN:-2}"
+KCP_MTU="${KCP_MTU:-1350}"
+KCP_SNDWND="${KCP_SNDWND:-1024}"
+KCP_RCVWND="${KCP_RCVWND:-1024}"
+KCP_NODELAY="${KCP_NODELAY:-0}"
+KCP_INTERVAL="${KCP_INTERVAL:-20}"
+KCP_RESEND="${KCP_RESEND:-2}"
+KCP_NOCONGESTION="${KCP_NOCONGESTION:-0}"
+KCP_SOCKBUF="${KCP_SOCKBUF:-4194304}"
+KCP_SMUXBUF="${KCP_SMUXBUF:-4194304}"
+TURBO_ENABLED="${TURBO_ENABLED:-false}"
+WATCHDOG_ENABLED="${WATCHDOG_ENABLED:-false}"
+SEOF
+    )
+    if ! mv "$_tmp" "$INSTALL_DIR/settings.conf"; then
+        log_error "Failed to save settings"
+        rm -f "$_tmp"
+        return 1
+    fi
+    chmod 600 "$INSTALL_DIR/settings.conf" 2>/dev/null
+}
+# shellcheck shell=bash
+# Backend install/config helpers (paqet binary, GFW-knocker scripts).
+# Included into both the installer and the management script by build.sh.
+
+#═══════════════════════════════════════════════════════════════════════
+# paqet binary
+#═══════════════════════════════════════════════════════════════════════
+
+download_paqet() {
+    local version="$1"
+    local arch
+    arch=$(detect_arch) || return 1
+    local os_name="linux"
+    local ext="tar.gz"
+    local filename="paqet-${os_name}-${arch}-${version}.${ext}"
+    local url="https://github.com/${PAQET_REPO}/releases/download/${version}/${filename}"
+
+    log_info "Downloading paqet ${version} for ${os_name}/${arch}..."
+
+    if ! mkdir -p "$INSTALL_DIR/bin"; then
+        log_error "Failed to create directory $INSTALL_DIR/bin"
+        return 1
+    fi
+    local tmp_file
+    tmp_file=$(mktemp "/tmp/paqet-download-XXXXXXXX.${ext}") || { log_error "Failed to create temp file"; return 1; }
+
+    # Try curl first, fallback to wget
+    local download_ok=false
+    if curl -sL --max-time 180 --retry 3 --retry-delay 5 --fail -o "$tmp_file" "$url" 2>/dev/null; then
+        download_ok=true
+    elif command -v wget &>/dev/null; then
+        log_info "curl failed, trying wget..."
+        rm -f "$tmp_file"
+        if wget -q --timeout=180 --tries=3 -O "$tmp_file" "$url" 2>/dev/null; then
+            download_ok=true
+        fi
+    fi
+
+    if [ "$download_ok" != "true" ]; then
+        log_error "Failed to download: $url"
+        log_error "Try manual download: wget '$url' and place binary in $INSTALL_DIR/bin/"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    # Validate download
+    local fsize
+    fsize=$(stat -c%s "$tmp_file" 2>/dev/null || stat -f%z "$tmp_file" 2>/dev/null || wc -c < "$tmp_file" 2>/dev/null || echo 0)
+    if [ "$fsize" -lt 1000 ]; then
+        log_error "Downloaded file is too small ($fsize bytes). Download may have failed."
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    # Extract
+    log_info "Extracting..."
+    local tmp_extract
+    tmp_extract=$(mktemp -d "/tmp/paqet-extract-XXXXXXXX") || { log_error "Failed to create temp file"; return 1; }
+    if ! tar -xzf "$tmp_file" -C "$tmp_extract" 2>/dev/null; then
+        log_error "Failed to extract archive"
+        rm -f "$tmp_file"
+        rm -rf "$tmp_extract"
+        return 1
+    fi
+
+    # Find the binary in extracted files
+    local binary_name="paqet_${os_name}_${arch}"
+    local found_binary=""
+    found_binary=$(find "$tmp_extract" -name "$binary_name" -type f 2>/dev/null | head -1)
+    if [ -z "$found_binary" ]; then
+        # Try alternate name patterns
+        found_binary=$(find "$tmp_extract" -name "paqet*" -type f -executable 2>/dev/null | head -1)
+    fi
+    if [ -z "$found_binary" ]; then
+        found_binary=$(find "$tmp_extract" -name "paqet*" -type f 2>/dev/null | head -1)
+    fi
+
+    if [ -z "$found_binary" ]; then
+        log_error "Could not find paqet binary in archive"
+        rm -f "$tmp_file"
+        rm -rf "$tmp_extract"
+        return 1
+    fi
+
+    # Stop paqet if running to avoid "Text file busy" error
+    if pgrep -f "$INSTALL_DIR/bin/paqet" &>/dev/null; then
+        log_info "Stopping paqet to update binary..."
+        pkill -f "$INSTALL_DIR/bin/paqet" 2>/dev/null || true
+        sleep 1
+    fi
+
+    if ! cp "$found_binary" "$INSTALL_DIR/bin/paqet"; then
+        log_error "Failed to copy paqet binary to $INSTALL_DIR/bin/"
+        rm -f "$tmp_file"
+        rm -rf "$tmp_extract"
+        return 1
+    fi
+    if ! chmod +x "$INSTALL_DIR/bin/paqet"; then
+        log_error "Failed to make paqet binary executable"
+        return 1
+    fi
+
+    # Copy example configs if they exist
+    find "$tmp_extract" -name "*.yaml.example" -exec cp {} "$INSTALL_DIR/" \; 2>/dev/null || true
+
+    rm -f "$tmp_file"
+    rm -rf "$tmp_extract"
+
+    # Verify binary runs
+    if "$INSTALL_DIR/bin/paqet" version &>/dev/null; then
+        log_success "paqet ${version} installed successfully"
+    else
+        log_warn "paqet binary installed but version check failed (may need libpcap)"
+    fi
+}
+
+#═══════════════════════════════════════════════════════════════════════
+# GFW-knocker
+#═══════════════════════════════════════════════════════════════════════
+
+install_python_deps() {
+    log_info "Installing Python dependencies for GFW-knocker..."
+    _ensure_pkg_manager
+    if ! command -v python3 &>/dev/null; then
+        install_package python3
+    fi
+    # Ensure python3 version >= 3.10
+    local pyver
+    pyver=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0.0")
+    local pymajor pyminor
+    pymajor=$(echo "$pyver" | cut -d. -f1)
+    pyminor=$(echo "$pyver" | cut -d. -f2)
+    if [ "$pymajor" -lt 3 ] || { [ "$pymajor" -eq 3 ] && [ "$pyminor" -lt 10 ]; }; then
+        log_error "Python 3.10+ required, found $pyver"
+        return 1
+    fi
+
+    # Install venv support (varies by distro)
+    # - Debian/Ubuntu: needs python3-venv or python3.X-venv package
+    # - Fedora/RHEL/Arch/openSUSE: venv included with python3, just need pip
+    # - Alpine: needs py3-pip
+    case "$PKG_MANAGER" in
+        apt)
+            # Debian/Ubuntu needs python3-venv package (version-specific)
+            local pyver_full
+            pyver_full=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
+            if [ -n "$pyver_full" ]; then
+                install_package "python${pyver_full}-venv" || install_package "python3-venv"
+            else
+                install_package "python3-venv"
+            fi
+            ;;
+        dnf)
+            # Fedora/RHEL 8+: venv is included with python3, just ensure pip
+            install_package "python3-pip" || true
+            ;;
+        yum)
+            # Older RHEL/CentOS 7
+            install_package "python3-pip" || true
+            ;;
+        pacman)
+            # Arch Linux: venv included with python, pip is separate
+            install_package "python-pip" || true
+            ;;
+        zypper)
+            # openSUSE: venv included with python3
+            install_package "python3-pip" || true
+            ;;
+        apk)
+            # Alpine
+            install_package "py3-pip" || true
+            ;;
+        *)
+            # Try generic python3-venv, ignore if fails (venv may be built-in)
+            install_package "python3-venv" 2>/dev/null || true
+            ;;
+    esac
+
+    # Create virtual environment
+    local VENV_DIR="$INSTALL_DIR/venv"
+    # Check if venv exists AND is complete (has pip)
+    if [ ! -x "$VENV_DIR/bin/pip" ]; then
+        # Remove broken/incomplete venv if exists
+        [ -d "$VENV_DIR" ] && rm -rf "$VENV_DIR"
+        log_info "Creating Python virtual environment..."
+        python3 -m venv "$VENV_DIR" || {
+            log_error "Failed to create virtual environment (is python3-venv installed?)"
+            return 1
+        }
+    fi
+
+    # Verify pip exists after venv creation
+    if [ ! -x "$VENV_DIR/bin/pip" ]; then
+        log_error "venv created but pip missing (install python3-venv package)"
+        return 1
+    fi
+
+    # Install packages in venv
+    log_info "Installing scapy and aioquic in venv..."
+    "$VENV_DIR/bin/pip" install --quiet --upgrade pip 2>/dev/null || true
+    "$VENV_DIR/bin/pip" install --quiet scapy aioquic 2>/dev/null || {
+        # Try with --break-system-packages as fallback (shouldn't be needed in venv)
+        "$VENV_DIR/bin/pip" install scapy aioquic || {
+            log_error "Failed to install Python packages (scapy, aioquic)"
+            return 1
+        }
+    }
+
+    # Verify
+    if "$VENV_DIR/bin/python" -c "import scapy; import aioquic" 2>/dev/null; then
+        log_success "Python dependencies installed (scapy, aioquic)"
+    else
+        log_error "Python package verification failed"
+        return 1
+    fi
+}
+
+install_microsocks() {
+    log_info "Installing microsocks for SOCKS5 proxy..."
+    if [ -x "$INSTALL_DIR/bin/microsocks" ]; then
+        log_success "microsocks already installed"
+        return 0
+    fi
+    # Build dependencies
+    command -v gcc &>/dev/null || install_package gcc
+    command -v make &>/dev/null || install_package make
+    _ensure_pkg_manager
+    # Alpine needs the libc headers to compile
+    [ "$PKG_MANAGER" = "apk" ] && { [ -f /usr/include/stdio.h ] || install_package musl-dev || true; }
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    if ! curl -sL "https://github.com/${MICROSOCKS_REPO}/archive/refs/heads/master.tar.gz" -o "$tmp_dir/microsocks.tar.gz"; then
+        log_error "Failed to download microsocks"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    tar -xzf "$tmp_dir/microsocks.tar.gz" -C "$tmp_dir" 2>/dev/null || {
+        log_error "Failed to extract microsocks"
+        rm -rf "$tmp_dir"
+        return 1
+    }
+    local src_dir
+    src_dir=$(find "$tmp_dir" -maxdepth 1 -type d -name "microsocks*" | head -1)
+    if [ -z "$src_dir" ]; then
+        log_error "microsocks source directory not found"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    if ! make -C "$src_dir" -j"$(nproc 2>/dev/null || echo 1)" 2>/dev/null; then
+        log_error "Failed to compile microsocks"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    mkdir -p "$INSTALL_DIR/bin"
+    cp "$src_dir/microsocks" "$INSTALL_DIR/bin/microsocks"
+    chmod 755 "$INSTALL_DIR/bin/microsocks"
+    rm -rf "$tmp_dir"
+    log_success "microsocks installed"
+}
+
+download_gfk() {
+    log_info "Downloading GFW-knocker scripts..."
+    if ! mkdir -p "$GFK_DIR"; then
+        log_error "Failed to create $GFK_DIR"
+        return 1
+    fi
+    # Note: parameters.py is generated by generate_gfk_config(), don't download it
+    # Download server scripts from gfk/server/
+    local server_files="mainserver.py quic_server.py vio_server.py"
+    local f
+    for f in $server_files; do
+        if ! curl -sL "$GFK_RAW_URL/server/$f" -o "$GFK_DIR/$f"; then
+            log_error "Failed to download $f"
+            return 1
+        fi
+    done
+    # Download client scripts from gfk/client/
+    local client_files="mainclient.py quic_client.py vio_client.py"
+    for f in $client_files; do
+        if ! curl -sL "$GFK_RAW_URL/client/$f" -o "$GFK_DIR/$f"; then
+            log_error "Failed to download $f"
+            return 1
+        fi
+    done
+    chmod 600 "$GFK_DIR"/*.py
+    # Patch mainserver.py to use venv python for subprocesses
+    if [ -f "$GFK_DIR/mainserver.py" ]; then
+        sed -i "s|'python3'|'$INSTALL_DIR/venv/bin/python'|g" "$GFK_DIR/mainserver.py"
+    fi
+    log_success "GFW-knocker scripts downloaded to $GFK_DIR"
+}
+
+generate_gfk_certs() {
+    if [ -f "$GFK_DIR/cert.pem" ] && [ -f "$GFK_DIR/key.pem" ]; then
+        log_info "GFW-knocker certificates already exist"
+        return 0
+    fi
+    if ! command -v openssl &>/dev/null; then
+        log_info "Installing openssl..."
+        install_package openssl || { log_error "Failed to install openssl"; return 1; }
+    fi
+    log_info "Generating QUIC TLS certificates..."
+    if ! openssl req -x509 -newkey rsa:2048 -keyout "$GFK_DIR/key.pem" \
+        -out "$GFK_DIR/cert.pem" -days 3650 -nodes -subj "/CN=gfk" 2>/dev/null; then
+        log_error "Failed to generate certificates"
+        return 1
+    fi
+    chmod 600 "$GFK_DIR/key.pem" "$GFK_DIR/cert.pem"
+    log_success "QUIC certificates generated"
+}
+
+generate_gfk_config() {
+    log_info "Generating GFW-knocker configuration..."
+    # Ensure GFK directory exists
+    mkdir -p "$GFK_DIR" || { log_error "Failed to create $GFK_DIR"; return 1; }
+    local _tmp
+    _tmp=$(mktemp "$GFK_DIR/parameters.py.XXXXXXXX") || { log_error "Failed to create temp file"; return 1; }
+
+    # Determine port values based on role - validate they are numeric
+    local vio_tcp_server_port="${GFK_VIO_PORT:-45000}"
+    local vio_tcp_client_port="${GFK_VIO_CLIENT_PORT:-40000}"
+    local vio_udp_server_port="${GFK_VIO_UDP_SERVER:-35000}"
+    local vio_udp_client_port="${GFK_VIO_UDP_CLIENT:-30000}"
+    local quic_server_port="${GFK_QUIC_PORT:-25000}"
+    local quic_client_port="${GFK_QUIC_CLIENT_PORT:-20000}"
+
+    # Validate all ports are numeric
+    for _p in "$vio_tcp_server_port" "$vio_tcp_client_port" "$vio_udp_server_port" \
+              "$vio_udp_client_port" "$quic_server_port" "$quic_client_port"; do
+        if ! [[ "$_p" =~ ^[0-9]+$ ]]; then
+            log_error "Invalid port number: $_p"
+            rm -f "$_tmp"
+            return 1
+        fi
+    done
+
+    # Escape Python string - prevents code injection
+    _escape_py_string() {
+        local s="$1"
+        s="${s//\\/\\\\}"   # Escape backslashes first
+        s="${s//\"/\\\"}"   # Escape double quotes
+        s="${s//\'/\\\'}"   # Escape single quotes
+        s="${s//$'\n'/\\n}" # Escape newlines
+        s="${s//$'\r'/\\r}" # Escape carriage returns
+        printf '%s' "$s"
+    }
+
+    # Validate and escape server IP
+    local safe_server_ip
+    safe_server_ip=$(_escape_py_string "${GFK_SERVER_IP:-}")
+    if ! _validate_ip "${GFK_SERVER_IP:-}"; then
+        log_error "Invalid server IP: ${GFK_SERVER_IP:-}"
+        rm -f "$_tmp"
+        return 1
+    fi
+
+    # Validate and escape auth code
+    local safe_auth_code
+    safe_auth_code=$(_escape_py_string "${GFK_AUTH_CODE:-}")
+
+    # Build port mapping dict string with validation
+    local tcp_mapping="${GFK_PORT_MAPPINGS:-14000:443}"
+    local mapping_str="{"
+    local first=true
+    local pair
+    for pair in $(echo "$tcp_mapping" | tr ',' ' '); do
+        local lport rport
+        lport=$(echo "$pair" | cut -d: -f1)
+        rport=$(echo "$pair" | cut -d: -f2)
+        # Validate both ports are numeric
+        if ! [[ "$lport" =~ ^[0-9]+$ ]] || ! [[ "$rport" =~ ^[0-9]+$ ]]; then
+            log_error "Invalid port mapping: $pair (must be numeric:numeric)"
+            rm -f "$_tmp"
+            return 1
+        fi
+        if [ "$first" = true ]; then
+            mapping_str="${mapping_str}${lport}: ${rport}"
+            first=false
+        else
+            mapping_str="${mapping_str}, ${lport}: ${rport}"
+        fi
+    done
+    mapping_str="${mapping_str}}"
+
+    # Escape GFK_DIR for Python string
+    local safe_gfk_dir
+    safe_gfk_dir=$(_escape_py_string "${GFK_DIR}")
+
+    (
+    umask 077
+    cat > "$_tmp" << PYEOF
+# GFW-knocker parameters - auto-generated by paqctl
+# Do not edit manually
+
+vps_ip = "${safe_server_ip}"
+xray_server_ip_address = "127.0.0.1"
+
+tcp_port_mapping = ${mapping_str}
+udp_port_mapping = {}
+
+vio_tcp_server_port = ${vio_tcp_server_port}
+vio_tcp_client_port = ${vio_tcp_client_port}
+vio_udp_server_port = ${vio_udp_server_port}
+vio_udp_client_port = ${vio_udp_client_port}
+
+quic_server_port = ${quic_server_port}
+quic_client_port = ${quic_client_port}
+quic_local_ip = "127.0.0.1"
+
+quic_idle_timeout = 86400
+udp_timeout = 300
+quic_mtu = ${KCP_MTU:-1350}
+quic_verify_cert = False
+quic_max_data = 1073741824
+quic_max_stream_data = 1073741824
+
+quic_auth_code = "${safe_auth_code}"
+
+quic_cert_filepath = ("${safe_gfk_dir}/cert.pem", "${safe_gfk_dir}/key.pem")
+
+tcp_flags = "${GFK_TCP_FLAGS:-AP}"
+PYEOF
+    )
+    if ! mv "$_tmp" "$GFK_DIR/parameters.py"; then
+        log_error "Failed to save GFW-knocker configuration"
+        rm -f "$_tmp"
+        return 1
+    fi
+    chmod 600 "$GFK_DIR/parameters.py"
+    log_success "GFW-knocker configuration saved"
+}
+
+create_gfk_client_wrapper() {
+    log_info "Creating GFW-knocker client wrapper..."
+    local wrapper="$INSTALL_DIR/bin/gfk-client.sh"
+    mkdir -p "$INSTALL_DIR/bin"
+    cat > "$wrapper" << 'WRAPEOF'
+#!/bin/bash
+set -e
+GFK_DIR="REPLACE_ME_GFK_DIR"
+INSTALL_DIR="REPLACE_ME_INSTALL_DIR"
+
+cd "$GFK_DIR"
+"$INSTALL_DIR/venv/bin/python" mainclient.py &
+PID1=$!
+trap "kill $PID1 2>/dev/null; wait" EXIT INT TERM
+wait
+WRAPEOF
+    sed "s#REPLACE_ME_GFK_DIR#${GFK_DIR}#g; s#REPLACE_ME_INSTALL_DIR#${INSTALL_DIR}#g" "$wrapper" > "$wrapper.sed" && mv "$wrapper.sed" "$wrapper"
+    chmod 755 "$wrapper"
+    log_success "Client wrapper created at $wrapper"
+}
+# shellcheck shell=bash
+# Xray (SOCKS5 for the GFK server).
+# Included into both the installer and the management script by build.sh.
+
+#═══════════════════════════════════════════════════════════════════════
+# Xray
+#═══════════════════════════════════════════════════════════════════════
+
+XRAY_CONFIG_DIR="/usr/local/etc/xray"
+XRAY_CONFIG_FILE="$XRAY_CONFIG_DIR/config.json"
+
+check_xray_installed() {
+    command -v xray &>/dev/null && return 0
+    [ -x /usr/local/bin/xray ] && return 0
+    [ -x /usr/local/x-ui/bin/xray-linux-amd64 ] && return 0
+    return 1
+}
+
+install_xray() {
+    if check_xray_installed; then
+        log_info "Xray is already installed"
+        return 0
+    fi
+
+    log_info "Installing Xray ${XRAY_VERSION_PINNED}..."
+
+    # Use official Xray install script with pinned version for stability
+    local tmp_script
+    tmp_script=$(mktemp)
+    if ! curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$tmp_script"; then
+        log_error "Failed to download Xray installer"
+        rm -f "$tmp_script"
+        return 1
+    fi
+
+    # Install specific version (not latest) for stability
+    if ! bash "$tmp_script" install --version "$XRAY_VERSION_PINNED" 2>/dev/null; then
+        log_error "Failed to install Xray"
+        rm -f "$tmp_script"
+        return 1
+    fi
+    rm -f "$tmp_script"
+
+    log_success "Xray ${XRAY_VERSION_PINNED} installed"
+}
+
+configure_xray_socks() {
+    local listen_port="${1:-443}"
+
+    log_info "Configuring Xray SOCKS5 proxy on port $listen_port..."
+
+    mkdir -p "$XRAY_CONFIG_DIR"
+
+    # Create simple SOCKS5 inbound config
+    cat > "$XRAY_CONFIG_FILE" << EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "port": ${listen_port},
+      "listen": "127.0.0.1",
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {}
+    }
+  ]
+}
+EOF
+    chmod 644 "$XRAY_CONFIG_FILE"  # Xray service runs as 'nobody', needs read access
+    log_success "Xray configured (SOCKS5 on 127.0.0.1:$listen_port)"
+}
+
+# Check if running xray is paqctl's own standalone install (not a real panel)
+# Returns 0 if standalone (all inbounds are socks on 127.0.0.1), 1 if panel
+_is_paqctl_standalone_xray() {
+    [ -f "$XRAY_CONFIG_FILE" ] || return 1
+    command -v python3 &>/dev/null || return 1
+    python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    inbounds = cfg.get('inbounds', [])
+    if not inbounds:
+        sys.exit(1)
+    for i in inbounds:
+        if i.get('protocol') != 'socks' or i.get('listen', '0.0.0.0') != '127.0.0.1':
+            sys.exit(1)
+    sys.exit(0)
+except:
+    sys.exit(1)
+" "$XRAY_CONFIG_FILE" 2>/dev/null
+}
+
+# Add a SOCKS5 inbound to an existing xray config (panel) without touching other inbounds
+_add_xray_gfk_socks() {
+    local port="$1"
+    python3 -c "
+import json, sys
+port = int(sys.argv[1])
+config_path = sys.argv[2]
+try:
+    with open(config_path, 'r') as f:
+        cfg = json.load(f)
+except:
+    cfg = {'inbounds': [], 'outbounds': [{'tag': 'direct', 'protocol': 'freedom', 'settings': {}}]}
+cfg.setdefault('inbounds', [])
+cfg['inbounds'] = [i for i in cfg['inbounds'] if i.get('tag') != 'gfk-socks']
+cfg['inbounds'].append({
+    'tag': 'gfk-socks',
+    'port': port,
+    'listen': '127.0.0.1',
+    'protocol': 'socks',
+    'settings': {'auth': 'noauth', 'udp': True},
+    'sniffing': {'enabled': True, 'destOverride': ['http', 'tls']}
+})
+if not any(o.get('protocol') == 'freedom' for o in cfg.get('outbounds', [])):
+    cfg.setdefault('outbounds', []).append({'tag': 'direct', 'protocol': 'freedom', 'settings': {}})
+with open(config_path, 'w') as f:
+    json.dump(cfg, f, indent=2)
+" "$port" "$XRAY_CONFIG_FILE" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        log_error "Failed to add SOCKS5 inbound to existing Xray config"
+        return 1
+    fi
+    log_success "Added GFK SOCKS5 inbound on 127.0.0.1:$port"
+}
+
+start_xray() {
+    log_info "Starting Xray service..."
+
+    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
+        # Stop first, reload daemon, then start - with retry
+        systemctl stop xray 2>/dev/null || true
+        sleep 1
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable xray 2>/dev/null || true
+
+        # Try up to 3 times
+        local attempt
+        for attempt in 1 2 3; do
+            systemctl start xray 2>/dev/null
+            sleep 2
+            if systemctl is-active --quiet xray; then
+                log_success "Xray started"
+                return 0
+            fi
+            [ "$attempt" -lt 3 ] && sleep 1
+        done
+        log_error "Failed to start Xray after 3 attempts"
+        return 1
+    else
+        # Direct start for non-systemd
+        local _xray_bin=""
+        [ -x /usr/local/bin/xray ] && _xray_bin="/usr/local/bin/xray"
+        [ -z "$_xray_bin" ] && [ -x /usr/local/x-ui/bin/xray-linux-amd64 ] && _xray_bin="/usr/local/x-ui/bin/xray-linux-amd64"
+        if [ -n "$_xray_bin" ]; then
+            pkill -x xray 2>/dev/null || true
+            sleep 1
+            nohup "$_xray_bin" run -c "$XRAY_CONFIG_FILE" > /var/log/xray.log 2>&1 &
+            sleep 2
+            if pgrep -f "xray" &>/dev/null; then
+                log_success "Xray started"
+                return 0
+            fi
+        fi
+        log_error "Failed to start Xray"
+        return 1
+    fi
+}
+
+stop_xray() {
+    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
+        systemctl stop xray 2>/dev/null || true
+    else
+        pkill -x xray 2>/dev/null || true
+    fi
+}
+
+setup_xray_for_gfk() {
+    local target_port
+    target_port=$(echo "${GFK_PORT_MAPPINGS:-14000:443}" | cut -d: -f2 | cut -d, -f1)
+
+    if pgrep -x xray &>/dev/null || pgrep -f "xray-linux" &>/dev/null; then
+        # Check if this is paqctl's own standalone Xray (not a real panel)
+        if _is_paqctl_standalone_xray; then
+            log_info "Existing Xray is paqctl's standalone install — reconfiguring..."
+            stop_xray
+            sleep 1
+            # Fall through to standalone install path below
+        else
+            XRAY_PANEL_DETECTED=true
+            log_info "Existing Xray detected — adding SOCKS5 alongside panel..."
+
+            # Clean up any leftover standalone GFK xray from prior installs
+            pkill -f "xray run -c.*gfk-socks.json" 2>/dev/null || true
+            rm -f "${XRAY_CONFIG_DIR}/gfk-socks.json" 2>/dev/null
+
+            # Check all existing target ports from mappings
+            local mapping pairs
+            IFS=',' read -ra pairs <<< "${GFK_PORT_MAPPINGS:-14000:443}"
+            for mapping in "${pairs[@]}"; do
+                local vio_port="${mapping%%:*}"
+                local tp="${mapping##*:}"
+                if ss -tln 2>/dev/null | grep -q ":${tp} "; then
+                    log_success "Port $tp is listening — GFK will forward VIO port $vio_port to this port"
+                else
+                    log_warn "Port $tp is NOT listening — make sure your panel inbound is on port $tp"
+                fi
+            done
+
+            # Find free port for SOCKS5 (starting at 10443)
+            local socks_port=10443
+            while ss -tln 2>/dev/null | grep -q ":${socks_port} "; do
+                socks_port=$((socks_port + 1))
+                if [ "$socks_port" -gt 65000 ]; then
+                    log_warn "Could not find free port for SOCKS5 — panel-only mode"
+                    echo ""
+                    local first_vio
+                    first_vio=$(echo "${GFK_PORT_MAPPINGS:-14000:443}" | cut -d: -f1 | cut -d, -f1)
+                    log_warn "For panel-to-panel: configure Iran panel outbound to 127.0.0.1:${first_vio}"
+                    return 0
+                fi
+            done
+
+            # Add SOCKS5 inbound to existing xray config
+            _add_xray_gfk_socks "$socks_port" || {
+                log_warn "Could not add SOCKS5 to panel config — panel-only mode"
+                return 0
+            }
+
+            # Restart xray to load new config
+            systemctl restart xray 2>/dev/null || pkill -SIGHUP xray 2>/dev/null || true
+            sleep 2
+
+            # Find next VIO port (highest existing + 1) and append SOCKS5 mapping
+            local max_vio=0
+            for mapping in "${pairs[@]}"; do
+                local v="${mapping%%:*}"
+                [ "$v" -gt "$max_vio" ] && max_vio="$v"
+            done
+            local socks_vio=$((max_vio + 1))
+            GFK_PORT_MAPPINGS="${GFK_PORT_MAPPINGS},${socks_vio}:${socks_port}"
+            GFK_SOCKS_PORT="$socks_port"
+            GFK_SOCKS_VIO_PORT="$socks_vio"
+
+            log_success "SOCKS5 proxy added on port $socks_port (VIO port $socks_vio)"
+            echo ""
+            log_info "Port mappings updated: ${GFK_PORT_MAPPINGS}"
+            log_warn "Use these SAME mappings on the client side"
+            echo ""
+            local first_vio
+            first_vio=$(echo "${GFK_PORT_MAPPINGS:-14000:443}" | cut -d: -f1 | cut -d, -f1)
+            log_warn "For panel-to-panel: configure Iran panel outbound to 127.0.0.1:${first_vio}"
+            log_warn "For direct SOCKS5: use 127.0.0.1:${socks_vio} as your proxy on client"
+            return 0
+        fi
+    fi
+
+    install_xray || return 1
+    configure_xray_socks "$target_port" || return 1
+    start_xray || return 1
+}
+
+# Safe string length check - prevents DoS via extremely long inputs
+_check_length() { [ ${#1} -le "${2:-256}" ]; }
+
 # Load settings
 _load_settings
 ROLE=${ROLE:-server}
@@ -2615,14 +3723,6 @@ _require_root() {
         return 1
     fi
 }
-
-# In --json mode, human-readable log lines go to stderr so stdout stays valid JSON
-_log_fd() { if [ "$JSON_OUTPUT" = true ]; then cat >&2; else cat; fi; }
-log_info()    { echo -e "${BLUE}[INFO]${NC} $1" | _log_fd; }
-log_success() { echo -e "${GREEN}[✓]${NC} $1" | _log_fd; }
-log_warn()    { echo -e "${YELLOW}[!]${NC} $1" | _log_fd; }
-log_error()   { echo -e "${RED}[✗]${NC} $1" >&2; }
-
 #═══════════════════════════════════════════════════════════════════════
 # CLI helpers: prompts, JSON, locking, backend detection
 #═══════════════════════════════════════════════════════════════════════
@@ -2723,29 +3823,6 @@ _write_paqet_config() {
     return 0
 }
 
-# Persist current firewall state so it survives a reboot
-persist_iptables_rules() {
-    if _is_firewalld_active; then
-        firewall-cmd --runtime-to-permanent 2>/dev/null || true
-        return 0
-    fi
-    if [ -x /etc/init.d/iptables ]; then
-        /etc/init.d/iptables save 2>/dev/null || true
-    fi
-    if command -v netfilter-persistent &>/dev/null; then
-        netfilter-persistent save 2>/dev/null || true
-    elif command -v iptables-save &>/dev/null; then
-        if [ -d /etc/iptables ] || [ -f /etc/debian_version ]; then
-            mkdir -p /etc/iptables
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-            command -v ip6tables-save &>/dev/null && { ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true; }
-        elif [ -d /etc/sysconfig ]; then
-            iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
-            command -v ip6tables-save &>/dev/null && { ip6tables-save > /etc/sysconfig/ip6tables 2>/dev/null || true; }
-        fi
-    fi
-}
-
 # Used by the watchdog; no-op unless Telegram is configured
 send_telegram_alert() {
     [ "${TELEGRAM_ENABLED:-false}" = "true" ] || return 0
@@ -2808,38 +3885,6 @@ _set_boot() {
     fi
 }
 
-# Retry helper with exponential backoff for API requests
-_curl_with_retry() {
-    local url="$1"
-    local max_attempts="${2:-3}"
-    local attempt=1
-    local delay=2
-    local response=""
-    while [ $attempt -le $max_attempts ]; do
-        response=$(curl -s --max-time 15 "$url" 2>/dev/null)
-        if [ -n "$response" ]; then
-            if echo "$response" | grep -q '"message".*rate limit'; then
-                log_warn "API rate limited, waiting ${delay}s..."
-                sleep $delay
-                delay=$((delay * 2))
-                attempt=$((attempt + 1))
-                continue
-            fi
-            echo "$response"
-            return 0
-        fi
-        [ $attempt -lt $max_attempts ] && sleep $delay
-        delay=$((delay * 2))
-        attempt=$((attempt + 1))
-    done
-    return 1
-}
-
-_validate_version_tag() {
-    # Strict validation: only allow vX.Y.Z or X.Y.Z format with optional -suffix
-    [[ "$1" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?$ ]]
-}
-
 # Safe sed: escape replacement string to prevent metachar injection
 _sed_escape() { printf '%s\n' "$1" | sed 's/[&/\]/\\&/g'; }
 _safe_update_setting() {
@@ -2853,390 +3898,6 @@ _safe_update_setting() {
         echo "${key}=\"${value}\"" >> "$file" 2>/dev/null || true
     fi
 }
-
-print_header() {
-    echo -e "${CYAN}"
-    echo "╔════════════════════════════════════════════════════════════════╗"
-    echo "║                  PAQCTL - Paqet Manager v${VERSION}                   ║"
-    echo "║        Raw-socket encrypted proxy - bypass firewalls           ║"
-    echo "╚════════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-}
-
-#═══════════════════════════════════════════════════════════════════════
-# Settings Save (management script)
-#═══════════════════════════════════════════════════════════════════════
-
-save_settings() {
-    local _tg_token="${TELEGRAM_BOT_TOKEN:-}"
-    local _tg_chat="${TELEGRAM_CHAT_ID:-}"
-    local _tg_interval="${TELEGRAM_INTERVAL:-6}"
-    local _tg_enabled="${TELEGRAM_ENABLED:-false}"
-    local _tg_alerts="${TELEGRAM_ALERTS_ENABLED:-true}"
-    local _tg_daily="${TELEGRAM_DAILY_SUMMARY:-true}"
-    local _tg_weekly="${TELEGRAM_WEEKLY_SUMMARY:-true}"
-    local _tg_label="${TELEGRAM_SERVER_LABEL:-}"
-    local _tg_start_hour="${TELEGRAM_START_HOUR:-0}"
-    # Sanitize sensitive values - remove shell metacharacters and control chars
-    _sanitize_value() {
-        printf '%s' "$1" | tr -d '"$`\\'\''(){}[]<>|;&!\n\r\t'
-    }
-    local _safe_key; _safe_key=$(_sanitize_value "${ENCRYPTION_KEY:-}")
-    local _safe_auth; _safe_auth=$(_sanitize_value "${GFK_AUTH_CODE:-}")
-    local _tmp
-    _tmp=$(mktemp "$INSTALL_DIR/settings.conf.XXXXXXXX") || { log_error "Failed to create temp file"; return 1; }
-    (umask 077; cat > "$_tmp" << SEOF
-BACKEND="${BACKEND:-paqet}"
-ROLE="${ROLE}"
-PAQET_VERSION="${PAQET_VERSION:-unknown}"
-PAQCTL_VERSION="${VERSION}"
-LISTEN_PORT="${LISTEN_PORT:-}"
-SOCKS_PORT="${SOCKS_PORT:-}"
-INTERFACE="${INTERFACE:-}"
-LOCAL_IP="${LOCAL_IP:-}"
-GATEWAY_MAC="${GATEWAY_MAC:-}"
-ENCRYPTION_KEY="${_safe_key}"
-PAQET_TCP_LOCAL_FLAG="${PAQET_TCP_LOCAL_FLAG:-PA}"
-PAQET_TCP_REMOTE_FLAG="${PAQET_TCP_REMOTE_FLAG:-PA}"
-REMOTE_SERVER="${REMOTE_SERVER:-}"
-GFK_VIO_PORT="${GFK_VIO_PORT:-}"
-GFK_VIO_CLIENT_PORT="${GFK_VIO_CLIENT_PORT:-}"
-GFK_QUIC_PORT="${GFK_QUIC_PORT:-}"
-GFK_QUIC_CLIENT_PORT="${GFK_QUIC_CLIENT_PORT:-}"
-GFK_AUTH_CODE="${_safe_auth}"
-GFK_PORT_MAPPINGS="${GFK_PORT_MAPPINGS:-}"
-GFK_SOCKS_PORT="${GFK_SOCKS_PORT:-}"
-GFK_SOCKS_VIO_PORT="${GFK_SOCKS_VIO_PORT:-}"
-XRAY_PANEL_DETECTED="${XRAY_PANEL_DETECTED:-false}"
-MICROSOCKS_PORT="${MICROSOCKS_PORT:-}"
-GFK_SERVER_IP="${GFK_SERVER_IP:-}"
-GFK_TCP_FLAGS="${GFK_TCP_FLAGS:-AP}"
-TELEGRAM_BOT_TOKEN="${_tg_token}"
-TELEGRAM_CHAT_ID="${_tg_chat}"
-TELEGRAM_INTERVAL=${_tg_interval}
-TELEGRAM_ENABLED=${_tg_enabled}
-TELEGRAM_ALERTS_ENABLED=${_tg_alerts}
-TELEGRAM_DAILY_SUMMARY=${_tg_daily}
-TELEGRAM_WEEKLY_SUMMARY=${_tg_weekly}
-TELEGRAM_SERVER_LABEL="${_tg_label}"
-TELEGRAM_START_HOUR=${_tg_start_hour}
-ROUTING_MODE="${ROUTING_MODE:-socks5}"
-FORWARD_PORT="${FORWARD_PORT:-14000}"
-FORWARD_TARGET="${FORWARD_TARGET:-127.0.0.1:80}"
-KCP_PROFILE="${KCP_PROFILE:-standard}"
-KCP_CONN="${KCP_CONN:-2}"
-KCP_MTU="${KCP_MTU:-1350}"
-KCP_SNDWND="${KCP_SNDWND:-1024}"
-KCP_RCVWND="${KCP_RCVWND:-1024}"
-KCP_NODELAY="${KCP_NODELAY:-0}"
-KCP_INTERVAL="${KCP_INTERVAL:-20}"
-KCP_RESEND="${KCP_RESEND:-2}"
-KCP_NOCONGESTION="${KCP_NOCONGESTION:-0}"
-KCP_SOCKBUF="${KCP_SOCKBUF:-4194304}"
-KCP_SMUXBUF="${KCP_SMUXBUF:-4194304}"
-TURBO_ENABLED="${TURBO_ENABLED:-false}"
-WATCHDOG_ENABLED="${WATCHDOG_ENABLED:-false}"
-SEOF
-    )
-    if ! mv "$_tmp" "$INSTALL_DIR/settings.conf"; then
-        log_error "Failed to save settings"
-        rm -f "$_tmp"
-        return 1
-    fi
-    chmod 600 "$INSTALL_DIR/settings.conf" 2>/dev/null
-}
-
-#═══════════════════════════════════════════════════════════════════════
-# Architecture Detection & Paqet Download (management script)
-#═══════════════════════════════════════════════════════════════════════
-
-detect_arch() {
-    local arch
-    arch=$(uname -m)
-    case "$arch" in
-        x86_64|amd64) echo "amd64" ;;
-        aarch64|arm64) echo "arm64" ;;
-        armv7l|armv7|armhf) echo "arm32" ;;
-        mips64el|mips64le) echo "mips64le" ;;
-        mips64) echo "mips64" ;;
-        mipsel|mipsle) echo "mipsle" ;;
-        mips) echo "mips" ;;
-        *)
-            log_error "Unsupported architecture: $arch"
-            return 1
-            ;;
-    esac
-}
-
-download_paqet() {
-    local version="$1"
-    local arch
-    arch=$(detect_arch) || return 1
-    local os_name="linux"
-    local ext="tar.gz"
-    local filename="paqet-${os_name}-${arch}-${version}.${ext}"
-    local url="https://github.com/${PAQET_REPO}/releases/download/${version}/${filename}"
-
-    log_info "Downloading paqet ${version} for ${os_name}/${arch}..."
-
-    mkdir -p "$INSTALL_DIR/bin" || { log_error "Failed to create directory"; return 1; }
-    local tmp_file
-    tmp_file=$(mktemp "/tmp/paqet-download-XXXXXXXX.${ext}") || { log_error "Failed to create temp file"; return 1; }
-
-    # Try curl first, fallback to wget
-    local download_ok=false
-    if curl -sL --max-time 180 --retry 3 --retry-delay 5 --fail -o "$tmp_file" "$url" 2>/dev/null; then
-        download_ok=true
-    elif command -v wget &>/dev/null; then
-        log_info "curl failed, trying wget..."
-        rm -f "$tmp_file"
-        if wget -q --timeout=180 --tries=3 -O "$tmp_file" "$url" 2>/dev/null; then
-            download_ok=true
-        fi
-    fi
-
-    if [ "$download_ok" != "true" ]; then
-        log_error "Failed to download: $url"
-        log_error "Try manual download: wget '$url' and place binary in $INSTALL_DIR/bin/"
-        rm -f "$tmp_file"
-        return 1
-    fi
-
-    # Validate download
-    local fsize
-    fsize=$(stat -c%s "$tmp_file" 2>/dev/null || stat -f%z "$tmp_file" 2>/dev/null || wc -c < "$tmp_file" 2>/dev/null || echo 0)
-    if [ "$fsize" -lt 1000 ]; then
-        log_error "Downloaded file is too small ($fsize bytes)"
-        rm -f "$tmp_file"
-        return 1
-    fi
-
-    # Extract
-    log_info "Extracting..."
-    local tmp_extract
-    tmp_extract=$(mktemp -d "/tmp/paqet-extract-XXXXXXXX") || { log_error "Failed to create temp dir"; return 1; }
-    if ! tar -xzf "$tmp_file" -C "$tmp_extract" 2>/dev/null; then
-        log_error "Failed to extract archive"
-        rm -f "$tmp_file"; rm -rf "$tmp_extract"
-        return 1
-    fi
-
-    # Find the binary
-    local binary_name="paqet_${os_name}_${arch}"
-    local found_binary=""
-    found_binary=$(find "$tmp_extract" -name "$binary_name" -type f 2>/dev/null | head -1)
-    [ -z "$found_binary" ] && found_binary=$(find "$tmp_extract" -name "paqet*" -type f -executable 2>/dev/null | head -1)
-    [ -z "$found_binary" ] && found_binary=$(find "$tmp_extract" -name "paqet*" -type f 2>/dev/null | head -1)
-
-    if [ -z "$found_binary" ]; then
-        log_error "Could not find paqet binary in archive"
-        rm -f "$tmp_file"; rm -rf "$tmp_extract"
-        return 1
-    fi
-
-    # Stop paqet if running to avoid "Text file busy" error
-    pkill -f "$INSTALL_DIR/bin/paqet" 2>/dev/null || true
-    sleep 1
-
-    if ! cp "$found_binary" "$INSTALL_DIR/bin/paqet"; then
-        log_error "Failed to copy paqet binary"
-        rm -f "$tmp_file"; rm -rf "$tmp_extract"
-        return 1
-    fi
-    chmod +x "$INSTALL_DIR/bin/paqet" || { log_error "Failed to make paqet executable"; return 1; }
-
-    rm -f "$tmp_file"; rm -rf "$tmp_extract"
-
-    if "$INSTALL_DIR/bin/paqet" version &>/dev/null; then
-        log_success "paqet ${version} installed successfully"
-    else
-        log_warn "paqet installed but version check failed (may need libpcap)"
-    fi
-}
-
-#═══════════════════════════════════════════════════════════════════════
-# GFK Helper Functions (management script)
-#═══════════════════════════════════════════════════════════════════════
-
-install_python_deps() {
-    log_info "Installing Python dependencies..."
-    if ! command -v python3 &>/dev/null; then
-        if command -v apt-get &>/dev/null; then apt-get install -y python3 2>/dev/null
-        elif command -v dnf &>/dev/null; then dnf install -y python3 2>/dev/null
-        elif command -v yum &>/dev/null; then yum install -y python3 2>/dev/null
-        elif command -v apk &>/dev/null; then apk add python3 2>/dev/null
-        fi
-    fi
-    # Verify Python 3.10+ (required for GFK)
-    local pyver pymajor pyminor
-    pyver=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "0.0")
-    pymajor=$(echo "$pyver" | cut -d. -f1)
-    pyminor=$(echo "$pyver" | cut -d. -f2)
-    if [ "$pymajor" -lt 3 ] || { [ "$pymajor" -eq 3 ] && [ "$pyminor" -lt 10 ]; }; then
-        log_error "Python 3.10+ required, found $pyver"
-        return 1
-    fi
-    # Install python3-venv (version-specific for apt, generic for others)
-    if command -v apt-get &>/dev/null; then
-        apt-get install -y "python${pyver}-venv" 2>/dev/null || apt-get install -y python3-venv 2>/dev/null
-    elif command -v dnf &>/dev/null; then
-        dnf install -y python3-pip 2>/dev/null  # dnf includes venv in python3
-    elif command -v yum &>/dev/null; then
-        yum install -y python3-pip 2>/dev/null
-    elif command -v apk &>/dev/null; then
-        apk add py3-pip 2>/dev/null
-    fi
-    # Use venv (recreate if broken/incomplete)
-    local VENV_DIR="$INSTALL_DIR/venv"
-    if [ ! -x "$VENV_DIR/bin/pip" ]; then
-        [ -d "$VENV_DIR" ] && rm -rf "$VENV_DIR"
-        python3 -m venv "$VENV_DIR" || { log_error "Failed to create venv (is python3-venv installed?)"; return 1; }
-    fi
-    # Verify pip exists after venv creation
-    if [ ! -x "$VENV_DIR/bin/pip" ]; then
-        log_error "venv created but pip missing (install python${pyver}-venv)"
-        return 1
-    fi
-    "$VENV_DIR/bin/pip" install --quiet --upgrade pip 2>/dev/null || true
-    "$VENV_DIR/bin/pip" install --quiet scapy aioquic 2>/dev/null || { log_error "Failed to install Python packages"; return 1; }
-    "$VENV_DIR/bin/python" -c "import scapy; import aioquic" 2>/dev/null || { log_error "Python deps verification failed"; return 1; }
-    log_success "Python dependencies OK"
-}
-
-install_microsocks() {
-    log_info "Installing microsocks..."
-    [ -x "$INSTALL_DIR/bin/microsocks" ] && { log_success "microsocks already installed"; return 0; }
-    command -v gcc &>/dev/null || {
-        if command -v apt-get &>/dev/null; then apt-get install -y gcc make 2>/dev/null
-        elif command -v yum &>/dev/null; then yum install -y gcc make 2>/dev/null
-        elif command -v apk &>/dev/null; then apk add gcc make musl-dev 2>/dev/null
-        fi
-    }
-    local tmp_dir; tmp_dir=$(mktemp -d)
-    curl -sL "https://github.com/${MICROSOCKS_REPO}/archive/refs/heads/master.tar.gz" -o "$tmp_dir/ms.tar.gz" || { rm -rf "$tmp_dir"; return 1; }
-    tar -xzf "$tmp_dir/ms.tar.gz" -C "$tmp_dir" 2>/dev/null || { rm -rf "$tmp_dir"; return 1; }
-    local src; src=$(find "$tmp_dir" -maxdepth 1 -type d -name "microsocks*" | head -1)
-    [ -z "$src" ] && { rm -rf "$tmp_dir"; return 1; }
-    make -C "$src" -j"$(nproc 2>/dev/null || echo 1)" 2>/dev/null || { rm -rf "$tmp_dir"; return 1; }
-    mkdir -p "$INSTALL_DIR/bin"
-    cp "$src/microsocks" "$INSTALL_DIR/bin/microsocks"
-    chmod 755 "$INSTALL_DIR/bin/microsocks"
-    rm -rf "$tmp_dir"
-    log_success "microsocks installed"
-}
-
-download_gfk() {
-    log_info "Downloading GFW-knocker scripts..."
-    mkdir -p "$GFK_DIR" || return 1
-    # Note: parameters.py is generated by generate_gfk_config(), don't download it
-    local f
-    # Download server scripts from gfk/server/
-    for f in mainserver.py quic_server.py vio_server.py; do
-        curl -sL "$GFK_RAW_URL/server/$f" -o "$GFK_DIR/$f" || { log_error "Failed to download $f"; return 1; }
-    done
-    # Download client scripts from gfk/client/
-    for f in mainclient.py quic_client.py vio_client.py; do
-        curl -sL "$GFK_RAW_URL/client/$f" -o "$GFK_DIR/$f" || { log_error "Failed to download $f"; return 1; }
-    done
-    chmod 600 "$GFK_DIR"/*.py
-    # Patch mainserver.py to use venv python for subprocesses
-    [ -f "$GFK_DIR/mainserver.py" ] && sed -i "s|'python3'|'$INSTALL_DIR/venv/bin/python'|g" "$GFK_DIR/mainserver.py"
-    log_success "GFW-knocker scripts downloaded"
-}
-
-generate_gfk_certs() {
-    [ -f "$GFK_DIR/cert.pem" ] && [ -f "$GFK_DIR/key.pem" ] && return 0
-    if ! command -v openssl &>/dev/null; then
-        log_info "Installing openssl..."
-        if command -v apt-get &>/dev/null; then apt-get install -y openssl 2>/dev/null
-        elif command -v dnf &>/dev/null; then dnf install -y openssl 2>/dev/null
-        elif command -v yum &>/dev/null; then yum install -y openssl 2>/dev/null
-        elif command -v apk &>/dev/null; then apk add openssl 2>/dev/null
-        elif command -v pacman &>/dev/null; then pacman -S --noconfirm openssl 2>/dev/null
-        fi
-        command -v openssl &>/dev/null || { log_error "Failed to install openssl"; return 1; }
-    fi
-    log_info "Generating QUIC certificates..."
-    openssl req -x509 -newkey rsa:2048 -keyout "$GFK_DIR/key.pem" \
-        -out "$GFK_DIR/cert.pem" -days 3650 -nodes -subj "/CN=gfk" 2>/dev/null || return 1
-    chmod 600 "$GFK_DIR/key.pem" "$GFK_DIR/cert.pem"
-    log_success "QUIC certificates generated"
-}
-
-generate_gfk_config() {
-    log_info "Generating GFW-knocker config..."
-    local _tmp; _tmp=$(mktemp "$GFK_DIR/parameters.py.XXXXXXXX") || { log_error "Failed to create temp file"; return 1; }
-    local vio_tcp_server_port="${GFK_VIO_PORT:-45000}"
-    local vio_tcp_client_port="${GFK_VIO_CLIENT_PORT:-40000}"
-    local vio_udp_server_port="${GFK_VIO_UDP_SERVER:-35000}"
-    local vio_udp_client_port="${GFK_VIO_UDP_CLIENT:-30000}"
-    local quic_server_port="${GFK_QUIC_PORT:-25000}"
-    local quic_client_port="${GFK_QUIC_CLIENT_PORT:-20000}"
-    # Validate all ports are numeric
-    local _p; for _p in "$vio_tcp_server_port" "$vio_tcp_client_port" "$vio_udp_server_port" \
-              "$vio_udp_client_port" "$quic_server_port" "$quic_client_port"; do
-        [[ "$_p" =~ ^[0-9]+$ ]] || { log_error "Invalid port: $_p"; rm -f "$_tmp"; return 1; }
-    done
-    # Escape Python strings to prevent code injection
-    _esc_py() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//\'/\\\'}"; printf '%s' "$s"; }
-    local safe_ip; safe_ip=$(_esc_py "${GFK_SERVER_IP:-}")
-    local safe_auth; safe_auth=$(_esc_py "${GFK_AUTH_CODE:-}")
-    local safe_dir; safe_dir=$(_esc_py "${GFK_DIR}")
-    # Validate and build port mapping
-    local tcp_mapping="${GFK_PORT_MAPPINGS:-14000:443}"
-    local mapping_str="{" first=true pair lport rport
-    for pair in $(echo "$tcp_mapping" | tr ',' ' '); do
-        lport=$(echo "$pair" | cut -d: -f1); rport=$(echo "$pair" | cut -d: -f2)
-        [[ "$lport" =~ ^[0-9]+$ ]] && [[ "$rport" =~ ^[0-9]+$ ]] || { log_error "Invalid mapping: $pair"; rm -f "$_tmp"; return 1; }
-        [ "$first" = true ] && { mapping_str="${mapping_str}${lport}: ${rport}"; first=false; } || mapping_str="${mapping_str}, ${lport}: ${rport}"
-    done
-    mapping_str="${mapping_str}}"
-    (umask 077; cat > "$_tmp" << PYEOF
-vps_ip = "${safe_ip}"
-xray_server_ip_address = "127.0.0.1"
-tcp_port_mapping = ${mapping_str}
-udp_port_mapping = {}
-vio_tcp_server_port = ${vio_tcp_server_port}
-vio_tcp_client_port = ${vio_tcp_client_port}
-vio_udp_server_port = ${vio_udp_server_port}
-vio_udp_client_port = ${vio_udp_client_port}
-quic_server_port = ${quic_server_port}
-quic_client_port = ${quic_client_port}
-quic_local_ip = "127.0.0.1"
-quic_idle_timeout = 86400
-udp_timeout = 300
-quic_mtu = ${KCP_MTU:-1350}
-quic_verify_cert = False
-quic_max_data = 1073741824
-quic_max_stream_data = 1073741824
-quic_auth_code = "${safe_auth}"
-quic_cert_filepath = ("${safe_dir}/cert.pem", "${safe_dir}/key.pem")
-tcp_flags = "${GFK_TCP_FLAGS:-AP}"
-PYEOF
-    )
-    mv "$_tmp" "$GFK_DIR/parameters.py" || { rm -f "$_tmp"; return 1; }
-    chmod 600 "$GFK_DIR/parameters.py"
-    log_success "GFW-knocker config saved"
-}
-
-create_gfk_client_wrapper() {
-    local wrapper="$INSTALL_DIR/bin/gfk-client.sh"
-    mkdir -p "$INSTALL_DIR/bin"
-    cat > "$wrapper" << 'WEOF'
-#!/bin/bash
-set -e
-GFK_DIR="REPLACE_GFK"
-INSTALL_DIR="REPLACE_INST"
-cd "$GFK_DIR"
-"$INSTALL_DIR/venv/bin/python" mainclient.py &
-PID1=$!
-trap "kill $PID1 2>/dev/null; wait" EXIT INT TERM
-wait
-WEOF
-    sed "s#REPLACE_GFK#${GFK_DIR}#g; s#REPLACE_INST#${INSTALL_DIR}#g" "$wrapper" > "$wrapper.sed" && mv "$wrapper.sed" "$wrapper"
-    chmod 755 "$wrapper"
-}
-
 #═══════════════════════════════════════════════════════════════════════
 # Service Control
 #═══════════════════════════════════════════════════════════════════════
@@ -4222,14 +4883,10 @@ restart_paqet() {
     sleep 1
     start_paqet
 }
-
 #═══════════════════════════════════════════════════════════════════════
 # Firewall (internal commands)
 #═══════════════════════════════════════════════════════════════════════
 
-_is_firewalld_active() {
-    command -v firewall-cmd &>/dev/null && firewall-cmd --state 2>/dev/null | grep -q running
-}
 
 _apply_firewall() {
     if ! _is_firewalld_active && ! command -v iptables &>/dev/null; then
@@ -4475,7 +5132,6 @@ _remove_all_paqctl_firewall_rules() {
 _persist_firewall() {
     persist_iptables_rules
 }
-
 #═══════════════════════════════════════════════════════════════════════
 # Status & Info
 #═══════════════════════════════════════════════════════════════════════
@@ -5196,7 +5852,6 @@ run_doctor() {
     fi
     _hc_report
 }
-
 #═══════════════════════════════════════════════════════════════════════
 # Update
 #═══════════════════════════════════════════════════════════════════════
@@ -5642,7 +6297,6 @@ generate_secret() {
     echo -e "  ${DIM}Share this key securely with client users.${NC}"
     echo ""
 }
-
 #═══════════════════════════════════════════════════════════════════════
 # Firewall Display
 #═══════════════════════════════════════════════════════════════════════
@@ -5763,7 +6417,6 @@ show_firewall() {
         esac
     done
 }
-
 #═══════════════════════════════════════════════════════════════════════
 # Configuration
 #═══════════════════════════════════════════════════════════════════════
@@ -6048,7 +6701,6 @@ change_config() {
         start_paqet
     fi
 }
-
 #═══════════════════════════════════════════════════════════════════════
 # Backup & Restore
 #═══════════════════════════════════════════════════════════════════════
@@ -6248,7 +6900,6 @@ restore_config() {
         start_paqet || return 1
     fi
 }
-
 #═══════════════════════════════════════════════════════════════════════
 # Diagnostics, Monitoring, Security & Maintenance
 #═══════════════════════════════════════════════════════════════════════
@@ -6960,7 +7611,7 @@ import_config_string() {
             return 1
         fi
         local bad=""
-        _valid_host "$_ip" || bad="server address '$_ip'"
+        _validate_ip "$_ip" || bad="server address '$_ip' (GFK needs an IPv4 address)"
         [ -z "$bad" ] && ! [[ "$_auth" =~ ^[A-Za-z0-9_-]{4,128}$ ]] && bad="auth code"
         [ -z "$bad" ] && [ -n "$_map" ] && ! [[ "$_map" =~ ^[0-9]+:[0-9]+(,[0-9]+:[0-9]+)*$ ]] && bad="port mappings '$_map'"
         [ -z "$bad" ] && [ -n "$_socks" ] && ! _validate_port "$_socks" && bad="SOCKS port '$_socks'"
@@ -6992,7 +7643,6 @@ import_config_string() {
     echo ""
     return $rc
 }
-
 #═══════════════════════════════════════════════════════════════════════
 # Telegram Integration
 #═══════════════════════════════════════════════════════════════════════
@@ -7708,7 +8358,6 @@ show_telegram_menu() {
         esac
     done
 }
-
 #═══════════════════════════════════════════════════════════════════════
 # Switch Backend
 #═══════════════════════════════════════════════════════════════════════
@@ -8062,244 +8711,14 @@ _install_paqet_components() {
     fi
 }
 
-check_xray_installed() {
-    command -v xray &>/dev/null && return 0
-    [ -x /usr/local/bin/xray ] && return 0
-    [ -x /usr/local/x-ui/bin/xray-linux-amd64 ] && return 0
-    return 1
-}
 
-XRAY_CONFIG_DIR="/usr/local/etc/xray"
-XRAY_CONFIG_FILE="$XRAY_CONFIG_DIR/config.json"
 
-install_xray() {
-    if check_xray_installed; then
-        log_info "Xray is already installed"
-        return 0
-    fi
 
-    log_info "Installing Xray ${XRAY_VERSION_PINNED}..."
 
-    local tmp_script
-    tmp_script=$(mktemp)
-    if ! curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$tmp_script"; then
-        log_error "Failed to download Xray installer"
-        rm -f "$tmp_script"
-        return 1
-    fi
 
-    if ! bash "$tmp_script" install --version "$XRAY_VERSION_PINNED" 2>/dev/null; then
-        log_error "Failed to install Xray"
-        rm -f "$tmp_script"
-        return 1
-    fi
-    rm -f "$tmp_script"
 
-    log_success "Xray ${XRAY_VERSION_PINNED} installed"
-}
 
-configure_xray_socks() {
-    local listen_port="${1:-443}"
-    log_info "Configuring Xray SOCKS5 proxy on port $listen_port..."
-    mkdir -p "$XRAY_CONFIG_DIR"
-    cat > "$XRAY_CONFIG_FILE" << EOF
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [{
-    "tag": "socks-in",
-    "port": ${listen_port},
-    "listen": "127.0.0.1",
-    "protocol": "socks",
-    "settings": { "auth": "noauth", "udp": true },
-    "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
-  }],
-  "outbounds": [{ "tag": "direct", "protocol": "freedom", "settings": {} }]
-}
-EOF
-    chmod 644 "$XRAY_CONFIG_FILE"
-    log_success "Xray configured (SOCKS5 on 127.0.0.1:$listen_port)"
-}
 
-_is_paqctl_standalone_xray() {
-    [ -f "$XRAY_CONFIG_FILE" ] || return 1
-    command -v python3 &>/dev/null || return 1
-    python3 -c "
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        cfg = json.load(f)
-    inbounds = cfg.get('inbounds', [])
-    if not inbounds:
-        sys.exit(1)
-    for i in inbounds:
-        if i.get('protocol') != 'socks' or i.get('listen', '0.0.0.0') != '127.0.0.1':
-            sys.exit(1)
-    sys.exit(0)
-except:
-    sys.exit(1)
-" "$XRAY_CONFIG_FILE" 2>/dev/null
-}
-
-_add_xray_gfk_socks() {
-    local port="$1"
-    python3 -c "
-import json, sys
-port = int(sys.argv[1])
-config_path = sys.argv[2]
-try:
-    with open(config_path, 'r') as f:
-        cfg = json.load(f)
-except:
-    cfg = {'inbounds': [], 'outbounds': [{'tag': 'direct', 'protocol': 'freedom', 'settings': {}}]}
-cfg.setdefault('inbounds', [])
-cfg['inbounds'] = [i for i in cfg['inbounds'] if i.get('tag') != 'gfk-socks']
-cfg['inbounds'].append({
-    'tag': 'gfk-socks', 'port': port, 'listen': '127.0.0.1', 'protocol': 'socks',
-    'settings': {'auth': 'noauth', 'udp': True},
-    'sniffing': {'enabled': True, 'destOverride': ['http', 'tls']}
-})
-if not any(o.get('protocol') == 'freedom' for o in cfg.get('outbounds', [])):
-    cfg.setdefault('outbounds', []).append({'tag': 'direct', 'protocol': 'freedom', 'settings': {}})
-with open(config_path, 'w') as f:
-    json.dump(cfg, f, indent=2)
-" "$port" "$XRAY_CONFIG_FILE" 2>/dev/null
-    if [ $? -ne 0 ]; then
-        log_error "Failed to add SOCKS5 inbound to existing Xray config"
-        return 1
-    fi
-    log_success "Added GFK SOCKS5 inbound on 127.0.0.1:$port"
-}
-
-stop_xray() {
-    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
-        systemctl stop xray 2>/dev/null || true
-    else
-        pkill -x xray 2>/dev/null || true
-    fi
-}
-
-start_xray() {
-    log_info "Starting Xray service..."
-    if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
-        systemctl stop xray 2>/dev/null || true
-        sleep 1
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl enable xray 2>/dev/null || true
-        local attempt
-        for attempt in 1 2 3; do
-            systemctl start xray 2>/dev/null
-            sleep 2
-            if systemctl is-active --quiet xray; then
-                log_success "Xray started"
-                return 0
-            fi
-            [ "$attempt" -lt 3 ] && sleep 1
-        done
-        log_error "Failed to start Xray after 3 attempts"
-        return 1
-    else
-        local _xray_bin=""
-        [ -x /usr/local/bin/xray ] && _xray_bin="/usr/local/bin/xray"
-        [ -z "$_xray_bin" ] && [ -x /usr/local/x-ui/bin/xray-linux-amd64 ] && _xray_bin="/usr/local/x-ui/bin/xray-linux-amd64"
-        if [ -n "$_xray_bin" ]; then
-            pkill -x xray 2>/dev/null || true
-            sleep 1
-            nohup "$_xray_bin" run -c "$XRAY_CONFIG_FILE" > /var/log/xray.log 2>&1 &
-            sleep 2
-            if pgrep -f "xray" &>/dev/null; then
-                log_success "Xray started"
-                return 0
-            fi
-        fi
-        log_error "Failed to start Xray"
-        return 1
-    fi
-}
-
-setup_xray_for_gfk() {
-    local target_port
-    target_port=$(echo "${GFK_PORT_MAPPINGS:-14000:443}" | cut -d: -f2 | cut -d, -f1)
-
-    if pgrep -x xray &>/dev/null || pgrep -f "xray-linux" &>/dev/null; then
-        # Check if this is paqctl's own standalone Xray (not a real panel)
-        if _is_paqctl_standalone_xray; then
-            log_info "Existing Xray is paqctl's standalone install — reconfiguring..."
-            stop_xray
-            sleep 1
-            # Fall through to standalone install path below
-        else
-            XRAY_PANEL_DETECTED=true
-            log_info "Existing Xray detected — adding SOCKS5 alongside panel..."
-
-            # Clean up any leftover standalone GFK xray from prior installs
-            pkill -f "xray run -c.*gfk-socks.json" 2>/dev/null || true
-            rm -f "${XRAY_CONFIG_DIR}/gfk-socks.json" 2>/dev/null
-
-            # Check all existing target ports from mappings
-            local mapping pairs
-            IFS=',' read -ra pairs <<< "${GFK_PORT_MAPPINGS:-14000:443}"
-            for mapping in "${pairs[@]}"; do
-                local vio_port="${mapping%%:*}"
-                local tp="${mapping##*:}"
-                if ss -tln 2>/dev/null | grep -q ":${tp} "; then
-                    log_success "Port $tp is listening — GFK will forward VIO port $vio_port to this port"
-                else
-                    log_warn "Port $tp is NOT listening — make sure your panel inbound is on port $tp"
-                fi
-            done
-
-            # Find free port for SOCKS5 (starting at 10443)
-            local socks_port=10443
-            while ss -tln 2>/dev/null | grep -q ":${socks_port} "; do
-                socks_port=$((socks_port + 1))
-                if [ "$socks_port" -gt 65000 ]; then
-                    log_warn "Could not find free port for SOCKS5 — panel-only mode"
-                    echo ""
-                    local first_vio
-                    first_vio=$(echo "${GFK_PORT_MAPPINGS:-14000:443}" | cut -d: -f1 | cut -d, -f1)
-                    log_warn "For panel-to-panel: configure Iran panel outbound to 127.0.0.1:${first_vio}"
-                    return 0
-                fi
-            done
-
-            # Add SOCKS5 inbound to existing xray config
-            _add_xray_gfk_socks "$socks_port" || {
-                log_warn "Could not add SOCKS5 to panel config — panel-only mode"
-                return 0
-            }
-
-            # Restart xray to load new config
-            systemctl restart xray 2>/dev/null || pkill -SIGHUP xray 2>/dev/null || true
-            sleep 2
-
-            # Find next VIO port (highest existing + 1) and append SOCKS5 mapping
-            local max_vio=0
-            for mapping in "${pairs[@]}"; do
-                local v="${mapping%%:*}"
-                [ "$v" -gt "$max_vio" ] && max_vio="$v"
-            done
-            local socks_vio=$((max_vio + 1))
-            GFK_PORT_MAPPINGS="${GFK_PORT_MAPPINGS},${socks_vio}:${socks_port}"
-            GFK_SOCKS_PORT="$socks_port"
-            GFK_SOCKS_VIO_PORT="$socks_vio"
-
-            log_success "SOCKS5 proxy added on port $socks_port (VIO port $socks_vio)"
-            echo ""
-            log_info "Port mappings updated: ${GFK_PORT_MAPPINGS}"
-            log_warn "Use these SAME mappings on the client side"
-            echo ""
-            local first_vio
-            first_vio=$(echo "${GFK_PORT_MAPPINGS:-14000:443}" | cut -d: -f1 | cut -d, -f1)
-            log_warn "For panel-to-panel: configure Iran panel outbound to 127.0.0.1:${first_vio}"
-            log_warn "For direct SOCKS5: use 127.0.0.1:${socks_vio} as your proxy on client"
-            return 0
-        fi
-    fi
-
-    install_xray || return 1
-    configure_xray_socks "$target_port" || return 1
-    start_xray || return 1
-}
 
 _install_gfk_components() {
     log_info "Installing GFK components..."
@@ -8349,7 +8768,6 @@ _install_gfk_components() {
 
     log_success "GFK components installed"
 }
-
 #═══════════════════════════════════════════════════════════════════════
 # Uninstall
 #═══════════════════════════════════════════════════════════════════════
@@ -8437,7 +8855,6 @@ except: pass
     log_success "paqctl has been completely uninstalled"
     echo ""
 }
-
 #═══════════════════════════════════════════════════════════════════════
 # Help
 #═══════════════════════════════════════════════════════════════════════
@@ -8871,7 +9288,7 @@ _config_validate() {
         KCP_MTU) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 500 ] && [ "$v" -le 9000 ] ;;
         KCP_CONN) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 64 ] ;;
         KCP_SNDWND|KCP_RCVWND) [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 16 ] && [ "$v" -le 65535 ] ;;
-        GFK_SERVER_IP) _validate_ip "$v" || [[ "$v" =~ ^[A-Za-z0-9.-]+$ ]] ;;
+        GFK_SERVER_IP) _validate_ip "$v" ;;   # GFK sends raw packets to it: IPv4 only
         GFK_AUTH_CODE) [[ "$v" =~ ^[A-Za-z0-9_-]{4,128}$ ]] ;;
         TELEGRAM_SERVER_LABEL) [[ "$v" =~ ^[A-Za-z0-9\ ._-]{1,64}$ ]] ;;
         *) return 3 ;;
@@ -9154,7 +9571,6 @@ show_version() {
     echo -e "  ${DIM}paqctl by SamNet-dev: https://github.com/SamNet-dev/paqctl${NC}"
     echo ""
 }
-
 #═══════════════════════════════════════════════════════════════════════
 # Paqet Diagnostic Tools (ping / dump)
 #═══════════════════════════════════════════════════════════════════════
@@ -9876,7 +10292,6 @@ show_menu() {
         esac
     done
 }
-
 #═══════════════════════════════════════════════════════════════════════
 # CLI Command Router
 #═══════════════════════════════════════════════════════════════════════
@@ -10028,57 +10443,9 @@ MANAGEMENT
 
     log_success "Management script installed → /usr/local/bin/paqctl"
 }
-
 #═══════════════════════════════════════════════════════════════════════
 # Main Installation Flow
 #═══════════════════════════════════════════════════════════════════════
-
-_load_settings() {
-    [ -f "$INSTALL_DIR/settings.conf" ] || return 0
-    # Safe settings loading without eval
-    while IFS='=' read -r key value; do
-        [[ "$key" =~ ^[A-Z_][A-Z_0-9]*$ ]] || continue
-        value="${value#\"}"; value="${value%\"}"
-        # Skip values with dangerous shell characters
-        [[ "$value" =~ [\`\$\(] ]] && continue
-        case "$key" in
-            BACKEND) BACKEND="$value" ;;
-            ROLE) ROLE="$value" ;;
-            PAQET_VERSION) PAQET_VERSION="$value" ;;
-            PAQCTL_VERSION) PAQCTL_VERSION="$value" ;;
-            LISTEN_PORT) [[ "$value" =~ ^[0-9]*$ ]] && LISTEN_PORT="$value" ;;
-            SOCKS_PORT) [[ "$value" =~ ^[0-9]*$ ]] && SOCKS_PORT="$value" ;;
-            INTERFACE) INTERFACE="$value" ;;
-            LOCAL_IP) LOCAL_IP="$value" ;;
-            GATEWAY_MAC) GATEWAY_MAC="$value" ;;
-            ENCRYPTION_KEY) ENCRYPTION_KEY="$value" ;;
-            PAQET_TCP_LOCAL_FLAG) [[ "$value" =~ ^[FSRPAUEC]+(,[FSRPAUEC]+)*$ ]] && PAQET_TCP_LOCAL_FLAG="$value" ;;
-            PAQET_TCP_REMOTE_FLAG) [[ "$value" =~ ^[FSRPAUEC]+(,[FSRPAUEC]+)*$ ]] && PAQET_TCP_REMOTE_FLAG="$value" ;;
-            REMOTE_SERVER) REMOTE_SERVER="$value" ;;
-            GFK_VIO_PORT) [[ "$value" =~ ^[0-9]*$ ]] && GFK_VIO_PORT="$value" ;;
-            GFK_VIO_CLIENT_PORT) [[ "$value" =~ ^[0-9]*$ ]] && GFK_VIO_CLIENT_PORT="$value" ;;
-            GFK_QUIC_PORT) [[ "$value" =~ ^[0-9]*$ ]] && GFK_QUIC_PORT="$value" ;;
-            GFK_QUIC_CLIENT_PORT) [[ "$value" =~ ^[0-9]*$ ]] && GFK_QUIC_CLIENT_PORT="$value" ;;
-            GFK_AUTH_CODE) GFK_AUTH_CODE="$value" ;;
-            GFK_PORT_MAPPINGS) GFK_PORT_MAPPINGS="$value" ;;
-            GFK_SOCKS_PORT) [[ "$value" =~ ^[0-9]*$ ]] && GFK_SOCKS_PORT="$value" ;;
-            GFK_SOCKS_VIO_PORT) [[ "$value" =~ ^[0-9]*$ ]] && GFK_SOCKS_VIO_PORT="$value" ;;
-            XRAY_PANEL_DETECTED) XRAY_PANEL_DETECTED="$value" ;;
-            MICROSOCKS_PORT) [[ "$value" =~ ^[0-9]*$ ]] && MICROSOCKS_PORT="$value" ;;
-            GFK_SERVER_IP) GFK_SERVER_IP="$value" ;;
-            GFK_TCP_FLAGS) [[ "$value" =~ ^[FSRPAUEC]+$ ]] && GFK_TCP_FLAGS="$value" ;;
-            TELEGRAM_BOT_TOKEN) TELEGRAM_BOT_TOKEN="$value" ;;
-            TELEGRAM_CHAT_ID) TELEGRAM_CHAT_ID="$value" ;;
-            TELEGRAM_INTERVAL) [[ "$value" =~ ^[0-9]+$ ]] && TELEGRAM_INTERVAL="$value" ;;
-            TELEGRAM_ENABLED) TELEGRAM_ENABLED="$value" ;;
-            TELEGRAM_ALERTS_ENABLED) TELEGRAM_ALERTS_ENABLED="$value" ;;
-            TELEGRAM_DAILY_SUMMARY) TELEGRAM_DAILY_SUMMARY="$value" ;;
-            TELEGRAM_WEEKLY_SUMMARY) TELEGRAM_WEEKLY_SUMMARY="$value" ;;
-            TELEGRAM_SERVER_LABEL) TELEGRAM_SERVER_LABEL="$value" ;;
-            TELEGRAM_START_HOUR) [[ "$value" =~ ^[0-9]+$ ]] && TELEGRAM_START_HOUR="$value" ;;
-        esac
-    done < <(grep '^[A-Z_][A-Z_0-9]*=' "$INSTALL_DIR/settings.conf")
-}
 
 # Handle --update-components flag (called during self-update)
 if [ "${1:-}" = "--update-components" ]; then
@@ -10118,6 +10485,16 @@ main() {
     log_info "Step 2/7: Installing dependencies..."
     check_dependencies
     echo ""
+
+    # Carry Telegram settings and fine-grained KCP tuning over a reinstall.
+    # Everything the wizard asks about (backend, role, network, routing,
+    # profile, turbo, watchdog) comes from the wizard, not the old file.
+    if [ -f "$INSTALL_DIR/settings.conf" ]; then
+        _load_settings TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID TELEGRAM_INTERVAL TELEGRAM_ENABLED \
+            TELEGRAM_ALERTS_ENABLED TELEGRAM_DAILY_SUMMARY TELEGRAM_WEEKLY_SUMMARY \
+            TELEGRAM_SERVER_LABEL TELEGRAM_START_HOUR \
+            KCP_NODELAY KCP_INTERVAL KCP_RESEND KCP_NOCONGESTION KCP_SOCKBUF KCP_SMUXBUF
+    fi
 
     # Step 3: Configuration wizard (determines backend + role + config)
     log_info "Step 3/7: Configuration..."
@@ -10393,9 +10770,8 @@ main() {
 case "${1:-}" in
     menu)
         check_root
-        if [ -f "$INSTALL_DIR/settings.conf" ]; then
-            _load_settings
-            show_menu
+        if [ -f "$INSTALL_DIR/settings.conf" ] && [ -x /usr/local/bin/paqctl ]; then
+            exec /usr/local/bin/paqctl menu
         else
             echo -e "${RED}paqctl is not installed. Run the installer first.${NC}"
             exit 1

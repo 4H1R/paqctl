@@ -1258,6 +1258,20 @@ For detailed tutorials and related tools, visit SamNet:
 Issues and pull requests are welcome at:
 https://github.com/SamNet-dev/paqctl
 
+`paqctl.sh` is generated - edit the sources in `src/` and rebuild:
+
+```
+src/installer.sh        installer entry point  (src/installer/*.sh)
+src/management.sh       the `paqctl` command   (src/management/*.sh)
+src/lib/*.sh            code shared by both, written once
+```
+
+```bash
+./build.sh            # regenerate paqctl.sh (commit it together with src/)
+./build.sh --check    # what CI runs: fails if paqctl.sh is out of date
+bats tests            # CLI tests
+```
+
 ---
 
 ## License
@@ -2375,6 +2389,20 @@ sudo paqctl -y rotate-key && sudo paqctl export --json | jq -r .uri
 
 مشکلات و pull request در گیت‌هاب:
 https://github.com/SamNet-dev/paqctl
+
+فایل `paqctl.sh` به صورت خودکار ساخته می‌شود؛ سورس‌ها را در پوشه `src/` ویرایش کنید و دوباره بسازید:
+
+```
+src/installer.sh        نقطه ورود نصب‌کننده  (src/installer/*.sh)
+src/management.sh       دستور paqctl          (src/management/*.sh)
+src/lib/*.sh            کد مشترک بین هر دو، فقط یک بار نوشته می‌شود
+```
+
+```bash
+./build.sh            # ساخت دوباره paqctl.sh (همراه با تغییرات src/ کامیت کنید)
+./build.sh --check    # بررسی CI: اگر paqctl.sh به‌روز نباشد خطا می‌دهد
+bats tests            # تست‌های خط فرمان
+```
 
 ---
 

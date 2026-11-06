@@ -1,0 +1,16 @@
+#@include management/00-head.sh
+#@include management/10-cli-helpers.sh
+#@include management/20-service-tuning.sh
+#@include management/30-firewall.sh
+#@include management/40-status-logs-health.sh
+#@include management/50-update.sh
+#@include management/55-firewall-menu.sh
+#@include management/60-config.sh
+#@include management/65-backup.sh
+#@include management/70-tools-security.sh
+#@include management/75-telegram.sh
+#@include management/80-backends.sh
+#@include management/85-uninstall.sh
+#@include management/90-cli.sh
+#@include management/95-menus.sh
+#@include management/99-router.sh

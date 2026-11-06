@@ -1,0 +1,4 @@
+# Shell sources must keep LF endings on every platform (build.sh rejects CRLF,
+# and bash cannot run scripts with CRLF line endings).
+*.sh    text eol=lf
+*.bats  text eol=lf
